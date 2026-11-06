@@ -1,0 +1,23 @@
+{
+  "name": "mnemosyne-server",
+  "version": "1.0.0",
+  "description": "Mnemosyne — 中心化记忆服务器。预测式记忆召回，SQLite + 时间轴 + 关系图谱。",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "mnemosyne": "./bin/cli.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "backup": "node scripts/backup.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "yaml": "^2.5.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}

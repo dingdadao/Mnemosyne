@@ -1,0 +1,30 @@
+# Mnemosyne DSH Plugin — Bundle Patch
+# 
+# 使用前请设置环境变量：
+#   MNEMOSYNE_URL      — 你的服务器地址（如 https://mnemosyne.example.com）
+#   MNEMOSYNE_TOKEN    — 你的认证令牌
+#
+# 或在下方直接填写你的值。
+
+- insert:
+    - id: mnemosyne
+      name: 'dsh-mnemosyne'
+      config:
+        # 服务器地址（必填）
+        mnemosyneUrl: !!js process.env.MNEMOSYNE_URL || 'http://127.0.0.1:8790'
+        # 认证令牌（必填）
+        mnemosyneToken: !!js process.env.MNEMOSYNE_TOKEN || ''
+        # 每会话最大提示数
+        maxHintsPerSession: 3
+        # 每会话最大自动召回数
+        maxAutoRecallsPerSession: 2
+        # 启用自动召回
+        enableAutoRecall: true
+        # 启用预测提示
+        enableHints: true
+        # System prompt 插入顺序
+        hintOrder: 95
+        # 默认工作区
+        workspace: 'default'
+        # HTTP 超时
+        timeoutMs: 10000

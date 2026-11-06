@@ -1,0 +1,14 @@
+{
+  "name": "dsh-mnemosyne",
+  "version": "1.0.0",
+  "description": "Mnemosyne — 预测式记忆召回层。Pull, not Push. Hint, not Inject.",
+  "type": "module",
+  "main": "index.js",
+  "dsh": {
+    "plugin": true
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.0"
+  },
+  "license": "MIT"
+}
