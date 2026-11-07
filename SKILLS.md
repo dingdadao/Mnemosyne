@@ -185,3 +185,60 @@ cp /tmp/mn/plugins/memory/mnemosyne/* /root/.hermes/hermes-agent/plugins/memory/
 ---
 
 *Mnemosyne — 记忆女神。一个协议，所有工具共享。*
+
+---
+
+## v3: 多账户支持 (Multi-Tenant)
+
+### 新增字段
+
+| 字段 | 说明 | 必填 |
+|------|------|------|
+| owner | 记忆归属者 | 否（默认=workspace） |
+| visibility | private / shared / public | 否（默认=private） |
+
+### 保存
+
+```json
+{
+  "content": "...",
+  "owner": "dingshuangdao",
+  "visibility": "shared"
+}
+```
+
+### 搜索
+
+```json
+{
+  "query": "...",
+  "owner": "dingshuangdao",
+  "include": ["own", "shared"]
+}
+```
+
+返回 = owner=dingshuangdao 的私有条目 ∪ visibility=shared 的条目
+
+### 权限
+
+- `private`: 只有 owner 能读写
+- `shared`: owner 读写，其他人可读
+- `public`: 所有人可读写
+
+写入 shared/public 需要 token 有 `can_write_shared` 权限。
+
+### 迁移
+
+```
+POST /memory/migrate-owner
+{ "from_workspace": "default", "default_owner": "admin", "visibility": "private" }
+```
+
+### Hermes 配置
+
+```bash
+# .env
+MNEMOSYNE_OWNER=dingshuangdao
+```
+
+各 profile 设置不同的 MNEMOSYNE_OWNER 实现多用户隔离。
