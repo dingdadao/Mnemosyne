@@ -16,6 +16,7 @@ import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'crypto';
 import Database from 'better-sqlite3';
+import { searchMemories, autoSummarize, findDuplicates, memoryHealth, jaccardSimilarity } from './search.js';
 
 // === Config ===
 const args = process.argv.slice(2);
@@ -47,6 +48,16 @@ if (!AUTH_TOKEN) {
 
 // Token hash for timing-safe comparison
 const TOKEN_HASH = createHash('sha256').update(AUTH_TOKEN).digest();
+
+// === Shared Write Permission ===
+function canWriteShared(token, visibility) {
+  if (!token) return false;
+  const hash = createHash('sha256').update(token).digest('hex');
+  const row = db.prepare("SELECT can_write_shared, can_write_public FROM owner_tokens WHERE token_hash = ?").get(hash);
+  if (!row) return false;
+  if (visibility === 'public') return row.can_write_public === 1;
+  return row.can_write_shared === 1;
+}
 
 // === Rate Limiter ===
 const requestCounts = new Map();
@@ -127,6 +138,10 @@ const db = new Database(join(DATA_DIR, 'mnemosyne.db'));
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous = NORMAL');
 
+// v3: add owner + visibility columns (idempotent)
+try { db.exec("ALTER TABLE memories ADD COLUMN owner TEXT DEFAULT ''"); } catch(e) {}
+try { db.exec("ALTER TABLE memories ADD COLUMN visibility TEXT DEFAULT 'private'"); } catch(e) {}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS workspaces (
     id TEXT PRIMARY KEY,
@@ -187,6 +202,8 @@ db.exec(`
     PRIMARY KEY (memory_id, entity_id)
   );
 
+  CREATE INDEX IF NOT EXISTS idx_memories_owner ON memories(workspace_id, owner, visibility, state);
+  
   CREATE INDEX IF NOT EXISTS idx_memories_timeline ON memories(workspace_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(workspace_id, kind, state);
   CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(workspace_id, state, importance DESC);
@@ -194,6 +211,15 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_relations_to ON relations(to_memory_id, relation_type);
 
   -- Audit log
+  -- v3: owner token permissions (who can write shared/public)
+  CREATE TABLE IF NOT EXISTS owner_tokens (
+    token_hash TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    can_write_shared INTEGER DEFAULT 0,
+    can_write_public INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+
   CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -272,12 +298,20 @@ const server = createServer(async (req, res) => {
   const providedToken = authHeader.replace('Bearer ', '');
   const providedHash = createHash('sha256').update(providedToken).digest();
   
-  if (!timingSafeEqual(providedHash, TOKEN_HASH)) {
+  // v3: accept master token OR any registered owner token
+  const isMaster = timingSafeEqual(providedHash, TOKEN_HASH);
+  let ownerRow = null;
+  if (!isMaster) {
+    ownerRow = db.prepare("SELECT owner FROM owner_tokens WHERE token_hash = ?").get(providedHash.toString('hex'));
+  }
+  if (!isMaster && !ownerRow) {
     stmts.insertAudit.run('auth_failed', null, null, clientIp, userAgent, 0);
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'unauthorized', hint: 'Provide Bearer token in Authorization header' }));
     return;
   }
+  // Bind caller identity for permission checks
+  const callerOwner = ownerRow ? ownerRow.owner : 'admin';
 
   // Parse URL
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -300,7 +334,7 @@ const server = createServer(async (req, res) => {
 
   // Route
   try {
-    const result = await route(path, req.method, query, body, clientIp, userAgent);
+    const result = await route(path, req.method, query, body, clientIp, userAgent, providedToken);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(result, null, 2));
   } catch (err) {
@@ -309,7 +343,7 @@ const server = createServer(async (req, res) => {
   }
 });
 
-async function route(path, method, query, body, clientIp, userAgent) {
+async function route(path, method, query, body, clientIp, userAgent, callerToken) {
   const workspaceId = query.workspace || body.workspace || 'default';
   let redactedCount = 0;
 
@@ -327,8 +361,24 @@ async function route(path, method, query, body, clientIp, userAgent) {
     
     const redactedSummary = body.summary ? redactSensitive(body.summary) : null;
     
-    stmts.insertMemory.run(
-      id, workspaceId, redactedContent, redactedSummary,
+    // Auto-generate summary if not provided
+    const finalSummary = redactedSummary || autoSummarize(redactedContent, 2);
+    
+    // v3: owner + visibility
+    const owner = body.owner || workspaceId;
+    const visibility = body.visibility || 'private';
+    
+    // Check shared write permission
+    if ((visibility === 'shared' || visibility === 'public') && !canWriteShared(callerToken, visibility)) {
+      stmts.insertAudit.run('save_denied', workspaceId, id, clientIp, userAgent, redactedCount);
+      throw { status: 403, message: 'No permission to write ' + visibility + ' memories' };
+    }
+    
+    db.prepare(`
+      INSERT INTO memories (id, workspace_id, content, summary, kind, tags, valid_from, valid_until, source_session, source_agent, importance, sensitivity, owner, visibility)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id, workspaceId, redactedContent, finalSummary,
       body.kind || 'fact',
       JSON.stringify(body.tags || []),
       body.valid_from || Math.floor(Date.now() / 1000),
@@ -336,7 +386,9 @@ async function route(path, method, query, body, clientIp, userAgent) {
       body.source_session || null,
       body.source_agent || 'unknown',
       body.importance ?? 0.5,
-      body.sensitivity || 'internal'
+      body.sensitivity || 'internal',
+      owner,
+      visibility
     );
 
     // Link entities if provided
@@ -364,26 +416,49 @@ async function route(path, method, query, body, clientIp, userAgent) {
     return mem;
   }
 
-  // POST /memory/search
+  // POST /memory/search — BM25 + decay + access boost
   if (path === '/memory/search' && method === 'POST') {
     const q = body.query || '';
     const limit = Math.min(body.limit || 20, 100);
     const offset = body.offset || 0;
     const kind = body.kind;
     
-    let results;
+    // Get all memories for this workspace
+    let allMemories;
     if (kind) {
-      results = stmts.searchByKind.all(workspaceId, kind, limit);
+      allMemories = db.prepare("SELECT * FROM memories WHERE workspace_id = ? AND kind = ? AND state = 'active'").all(workspaceId, kind);
     } else {
-      const pattern = `%${q}%`;
-      results = stmts.searchMemories.all(workspaceId, pattern, pattern, pattern, limit, offset);
+      allMemories = db.prepare("SELECT * FROM memories WHERE workspace_id = ? AND state = 'active'").all(workspaceId);
     }
-
+    
+    // Use v2 search engine (BM25 + decay + access boost)
+    // v3: filter by owner + include
+    const owner = body.owner || query.owner || '';
+    const include = body.include || ['own', 'shared'];
+    
+    let filtered = allMemories;
+    if (owner) {
+      filtered = allMemories.filter(m => {
+        const memOwner = m.owner || m.workspace_id;
+        const memVis = m.visibility || 'private';
+        
+        if (include.includes('own') && memOwner === owner) return true;
+        if (include.includes('shared') && memVis === 'shared') return true;
+        if (include.includes('public') && memVis === 'public') return true;
+        if (include.includes('all')) return true;
+        return false;
+      });
+    }
+    
+    const searchResult = searchMemories(filtered, q, { kind, limit, offset });
+    
+    // Bump access for returned results
+    for (const mem of searchResult.results) {
+      stmts.bumpAccess.run(mem.id);
+    }
+    
     stmts.insertAudit.run('search', workspaceId, null, clientIp, userAgent, 0);
-    return {
-      query: q, count: results.length,
-      results: results.map(m => ({ ...m, tags: JSON.parse(m.tags || '[]') }))
-    };
+    return searchResult;
   }
 
   // GET /memory/timeline
@@ -432,15 +507,15 @@ async function route(path, method, query, body, clientIp, userAgent) {
   // GET /health
   if (path === '/health' && method === 'GET') {
     return {
-      status: 'ok', version: '1.1.0-secure', uptime: process.uptime(),
-      workspace: workspaceId, stats: stmts.getStats.get(workspaceId),
+      status: 'ok', version: '3.0.0-multi-tenant', uptime: process.uptime(),
+      workspace: workspaceId, stats: (() => { const s = stmts.getStats.get(workspaceId); return { total: s.active, active: s.active, errors: s.errors, decisions: s.decisions, avg_importance: s.avg_importance }; })(),
       security: { redaction: true, rateLimit: true, auditLog: true }
     };
   }
 
   // GET /stats
   if (path === '/stats' && method === 'GET') {
-    return { workspace: workspaceId, stats: stmts.getStats.get(workspaceId) };
+    return { workspace: workspaceId, stats: (() => { const s = stmts.getStats.get(workspaceId); return { total: s.active, active: s.active, errors: s.errors, decisions: s.decisions, avg_importance: s.avg_importance }; })() };
   }
 
   // GET /audit
@@ -471,14 +546,203 @@ async function route(path, method, query, body, clientIp, userAgent) {
     return { status: 'backed_up', path: backupPath };
   }
 
+  // === V2 Endpoints ===
+
+  // GET /memory/health — Memory store health check
+  if (path === '/memory/health' && method === 'GET') {
+    const allMemories = db.prepare("SELECT * FROM memories WHERE workspace_id = ? AND state = 'active'").all(workspaceId);
+    const health = memoryHealth(allMemories);
+    return { workspace: workspaceId, ...health };
+  }
+
+  // GET /memory/duplicates — Find duplicate memories
+  if (path === '/memory/duplicates' && method === 'GET') {
+    const threshold = parseFloat(query.threshold) || 0.7;
+    const allMemories = db.prepare("SELECT id, content, kind, created_at FROM memories WHERE workspace_id = ? AND state = 'active'").all(workspaceId);
+    const duplicates = findDuplicates(allMemories, threshold);
+    return { workspace: workspaceId, count: duplicates.length, duplicates };
+  }
+
+  // POST /memory/consolidate — Merge near-duplicates (autoDream lite)
+  if (path === '/memory/consolidate' && method === 'POST') {
+    const threshold = body.threshold || 0.85;
+    const dryRun = body.dry_run || false;
+    
+    const allMemories = db.prepare("SELECT * FROM memories WHERE workspace_id = ? AND state = 'active' ORDER BY importance DESC").all(workspaceId);
+    const duplicates = findDuplicates(allMemories, threshold);
+    
+    if (dryRun) {
+      return { workspace: workspaceId, dry_run: true, would_merge: duplicates.length, duplicates };
+    }
+    
+    let merged = 0;
+    const mergeStmt = db.prepare("UPDATE memories SET state = 'archived', updated_at = unixepoch() WHERE id = ?");
+    
+    for (const dup of duplicates) {
+      // Archive the lower-importance one (later in list = lower importance)
+      mergeStmt.run(dup.b);
+      merged++;
+      
+      // Create relation
+      const relId = 'rel_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+      stmts.insertRelation.run(relId, dup.a, dup.b, 'supersede', dup.similarity, JSON.stringify({ auto_merged: true }));
+    }
+    
+    stmts.insertAudit.run('consolidate', workspaceId, null, clientIp, userAgent, 0);
+    return { workspace: workspaceId, merged, duplicates_found: duplicates.length };
+  }
+
+  // POST /memory/summarize — Generate summary for existing memory
+  if (path === '/memory/summarize' && method === 'POST') {
+    const mem = stmts.getMemory.get(body.id);
+    if (!mem) throw { status: 404, message: 'Memory not found' };
+    
+    const summary = autoSummarize(mem.content, body.max_sentences || 3);
+    
+    if (!dryRun) {
+      db.prepare("UPDATE memories SET summary = ?, updated_at = unixepoch() WHERE id = ?").run(summary, body.id);
+    }
+    
+    return { id: body.id, summary };
+  }
+
+  // GET /memory/stats/detailed — Detailed statistics
+  if (path === '/memory/stats/detailed' && method === 'GET') {
+    const byKind = db.prepare("SELECT kind, COUNT(*) as count, AVG(importance) as avg_importance FROM memories WHERE workspace_id = ? AND state = 'active' GROUP BY kind").all(workspaceId);
+    const byTag = db.prepare("SELECT tags, COUNT(*) as count FROM memories WHERE workspace_id = ? AND state = 'active' GROUP BY tags ORDER BY count DESC LIMIT 20").all(workspaceId);
+    const recentActivity = db.prepare("SELECT COUNT(*) as count FROM memories WHERE workspace_id = ? AND created_at > unixepoch() - 86400 * 7 AND state = 'active'").get(workspaceId);
+    const totalAccess = db.prepare("SELECT SUM(access_count) as total FROM memories WHERE workspace_id = ? AND state = 'active'").get(workspaceId);
+    
+    return {
+      workspace: workspaceId,
+      by_kind: byKind,
+      by_tag: byTag,
+      recent_7d: recentActivity.count,
+      total_accesses: totalAccess.total || 0,
+      health: memoryHealth(db.prepare("SELECT * FROM memories WHERE workspace_id = ? AND state = 'active'").all(workspaceId)),
+    };
+  }
+
+  // POST /memory/dream — Run full autoDream consolidation
+  if (path === '/memory/dream' && method === 'POST') {
+    const allMemories = db.prepare("SELECT * FROM memories WHERE workspace_id = ? AND state = 'active' ORDER BY importance DESC").all(workspaceId);
+    
+    // Step 1: Find and merge duplicates
+    const duplicates = findDuplicates(allMemories, 0.85);
+    let merged = 0;
+    const archiveStmt = db.prepare("UPDATE memories SET state = 'archived', updated_at = unixepoch() WHERE id = ?");
+    
+    for (const dup of duplicates) {
+      archiveStmt.run(dup.b);
+      const relId = 'rel_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+      stmts.insertRelation.run(relId, dup.a, dup.b, 'supersede', dup.similarity, JSON.stringify({ dream_merged: true }));
+      merged++;
+    }
+    
+    // Step 2: Auto-summarize memories without summary
+    const noSummary = allMemories.filter(m => !m.summary && m.content.length > 100);
+    let summarized = 0;
+    const summaryStmt = db.prepare("UPDATE memories SET summary = ?, updated_at = unixepoch() WHERE id = ?");
+    
+    for (const mem of noSummary.slice(0, 50)) { // Limit to 50 per run
+      const summary = autoSummarize(mem.content, 2);
+      if (summary) {
+        summaryStmt.run(summary, mem.id);
+        summarized++;
+      }
+    }
+    
+    // Step 3: Archive stale low-importance memories
+    const staleCutoff = Math.floor(Date.now() / 1000) - 90 * 86400; // 90 days
+    const staleLow = allMemories.filter(m => 
+      m.created_at < staleCutoff && 
+      (!m.access_count || m.access_count < 2) && 
+      (m.importance || 0.5) < 0.3
+    );
+    let archived = 0;
+    for (const mem of staleLow) {
+      archiveStmt.run(mem.id);
+      archived++;
+    }
+    
+    stmts.insertAudit.run('dream', workspaceId, null, clientIp, userAgent, 0);
+    
+    return {
+      workspace: workspaceId,
+      dream_run: true,
+      duplicates_merged: merged,
+      memories_summarized: summarized,
+      stale_archived: archived,
+      health_before: memoryHealth(allMemories),
+      total_processed: allMemories.length,
+    };
+  }
+
+  if (path === '/admin/token/create' && method === 'POST') {
+    const ownerName = body.owner || 'unnamed';
+    const canShared = body.can_write_shared ? 1 : 0;
+    const canPublic = body.can_write_public ? 1 : 0;
+    
+    // Generate new token
+    const newToken = randomBytes(32).toString('hex');
+    const newHash = createHash('sha256').update(newToken).digest('hex');
+    
+    db.prepare("INSERT OR REPLACE INTO owner_tokens (token_hash, owner, can_write_shared, can_write_public) VALUES (?, ?, ?, ?)").run(newHash, ownerName, canShared, canPublic);
+    
+    stmts.insertAudit.run('token-create', workspaceId, null, clientIp, userAgent, 0);
+    return { token: newToken, owner: ownerName, can_write_shared: canShared, can_write_public: canPublic };
+  }
+
+  // POST /memory/migrate-owner — Migrate existing records to owner system
+  if (path === '/memory/migrate-owner' && method === 'POST') {
+    const fromWs = body.from_workspace || 'default';
+    const fromOwner = body.from_owner || null;
+    const toOwner = body.to_owner || body.default_owner || 'default';
+    const defaultVis = body.visibility || null;
+    
+    let sql, params;
+    if (fromOwner) {
+      // Migrate specific owner to new owner
+      sql = "UPDATE memories SET owner = ? WHERE workspace_id = ? AND owner = ?";
+      params = [toOwner, fromWs, fromOwner];
+      if (defaultVis) {
+        sql = "UPDATE memories SET owner = ?, visibility = ? WHERE workspace_id = ? AND owner = ?";
+        params = [toOwner, defaultVis, fromWs, fromOwner];
+      }
+    } else {
+      // Migrate records with no owner
+      sql = "UPDATE memories SET owner = ? WHERE workspace_id = ? AND (owner IS NULL OR owner = '')";
+      params = [toOwner, fromWs];
+      if (defaultVis) {
+        sql = "UPDATE memories SET owner = ?, visibility = ? WHERE workspace_id = ? AND (owner IS NULL OR owner = '')";
+        params = [toOwner, defaultVis, fromWs];
+      }
+    }
+    
+    const updated = db.prepare(sql).run(...params);
+    
+    stmts.insertAudit.run('migrate-owner', workspaceId, null, clientIp, userAgent, 0);
+    return { migrated: updated.changes, from_owner: fromOwner, to_owner: toOwner, visibility: defaultVis };
+  }
+
+  // 404 fallback
   throw { status: 404, message: `Not found: ${method} ${path}` };
+}
+
+// v3: Register admin token with shared write permission
+{
+  const adminHash = createHash('sha256').update(AUTH_TOKEN).digest('hex');
+  try {
+    db.prepare("INSERT OR REPLACE INTO owner_tokens (token_hash, owner, can_write_shared, can_write_public) VALUES (?, ?, 1, 1)").run(adminHash, 'admin');
+    console.log('[mnemosyne] Admin token registered with shared+public write permission');
+  } catch {}
 }
 
 // === Start ===
 server.listen(PORT, HOST, () => {
   console.log(`
 ╔══════════════════════════════════════════════════════════════╗
-║    Mnemosyne Secure v1.1 — 记忆女神 · 中心化记忆服务器        ║
+║    Mnemosyne v3.0 Multi-Tenant — 记忆女神 · 中心化记忆服务器        ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Endpoint:  http://${HOST}:${PORT}                            ║
 ║  Auth:      Bearer ${AUTH_TOKEN.slice(0, 16)}...              ║

@@ -261,3 +261,52 @@ MNEMOSYNE_OWNER=dingshuangdao
 **关键区别**：
 - **有 hook 的系统**（DSH、Hermes）：自动召回 + 自动保存
 - **无 hook 的系统**（豆包、龙虾等）：只能手动调 API，但数据完全共享
+
+---
+
+## 管理 API（v3）
+
+### 创建受限 Token
+
+```bash
+POST /admin/token/create
+{
+  "owner": "yanyan",
+  "can_write_shared": false,
+  "can_write_public": false
+}
+# 响应: { "token": "...", "owner": "yanyan", "can_write_shared": 0 }
+```
+
+### 迁移 Owner
+
+```bash
+POST /memory/migrate-owner
+{
+  "from_workspace": "default",
+  "from_owner": "admin",        # 可选：源 owner
+  "to_owner": "dingshuangdao",  # 目标 owner
+  "visibility": "private"       # 可选：同时设置可见性
+}
+# 响应: { "migrated": 30, "from_owner": "admin", "to_owner": "dingshuangdao" }
+```
+
+不传 `from_owner` 时，只迁移 owner 为空的记录（向后兼容）。
+
+### 删除
+
+```bash
+DELETE /memory/delete?id=mem_xxx
+# 响应: { "id": "mem_xxx", "status": "deleted" }
+```
+
+## 认证模型
+
+两种 token：
+1. **主 Token**（AUTH_TOKEN）— 全部权限，可写 shared/public
+2. **受限 Token**（/admin/token/create 创建）— 权限由 can_write_shared 决定
+
+认证流程：
+- 主 token 哈希 === TOKEN_HASH → 通过，身份 admin
+- 否则查 owner_tokens 表 → 通过，身份为表里的 owner
+- 都不匹配 → 401
