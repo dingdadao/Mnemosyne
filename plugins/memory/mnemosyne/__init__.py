@@ -151,15 +151,23 @@ class MnemosyneProvider(MemoryProvider):
                 return ""
 
             filtered = []
-            query_words = set(query.lower().split())
-            
+            q = query.strip().lower()
+            # Chinese has no word separators, so split() leaves one giant token and the
+            # substring test below can never match anything real. Build the probe set from
+            # whitespace tokens PLUS CJK character bigrams so partial matches survive.
+            query_words = {w for w in q.split() if len(w) > 1}
+            cjk = "".join(ch for ch in q if "\u4e00" <= ch <= "\u9fff")
+            if len(cjk) >= 2:
+                query_words |= {cjk[i:i + 2] for i in range(len(cjk) - 1)}
+            if not query_words:
+                query_words = {q} if q else set()
+
             for m in results:
                 imp = m.get("importance", 0.5)
                 if imp < 0.4:
                     continue
-                content = m.get("content", "").lower()
-                has_match = any(w in content for w in query_words if len(w) > 1)
-                if not has_match:
+                content = (m.get("content") or "").lower()
+                if not any(w in content for w in query_words):
                     continue
                 filtered.append(m)
             
