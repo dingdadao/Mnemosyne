@@ -1,44 +1,31 @@
 # Mnemosyne — 通用 AI 记忆协议
 
 > 任何 AI 工具都可以接入的中心化记忆协议。
-> 只需要能发 HTTP 请求，就能共享记忆。
 
 ---
 
-## 两种使用模式
+## 两种模式
 
-### 模式 A：共享后端（推荐，零部署）
-
-直接使用公共 Mnemosyne 服务器。
-
-```
-你的 AI 工具 → https://mnemosyne.niao.fun → 共享记忆池
-```
-
-### 模式 B：自建后端（完全控制）
-
-```bash
-curl -sSL https://raw.githubusercontent.com/dingdadao/Mnemosyne/main/deploy/install-server.sh | bash
-```
+**A. 共享后端**：`https://mnemosyne.niao.fun`，向管理员要 Token
+**B. 自建后端**：`curl -sSL .../install-server.sh | bash`
 
 ---
 
-## 核心协议：HTTP + JSON
+## 核心协议
 
 ```
 认证: Authorization: Bearer <token>
 格式: JSON
-编码: UTF-8
 ```
 
-### 最小接入代码
+### 最小接入（5行）
 
 ```python
 import urllib.request, json
 
-def mnemosyne(action, token, url="https://mnemosyne.niao.fun", **kwargs):
-    body = json.dumps({"action": action, **kwargs}).encode()
-    req = urllib.request.Request(f"{url}/memory/{action}", data=body, method="POST")
+def mnemosyne(action, token, url="https://mnemosyne.niao.fun", **kw):
+    req = urllib.request.Request(f"{url}/memory/{action}",
+        data=json.dumps(kw).encode(), method="POST")
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Content-Type", "application/json")
     return json.loads(urllib.request.urlopen(req, timeout=10).read())
@@ -46,191 +33,147 @@ def mnemosyne(action, token, url="https://mnemosyne.niao.fun", **kwargs):
 
 ---
 
-## 账号库（自动记录登录凭据）
+## 凭据库
 
-**核心规则：AI 每次成功登录一台设备后，自动将账号信息存入 Mnemosyne。**
+**AI 每次成功登录/认证后，自动记录到 Mnemosyne。**
 
-### 触发时机
-
-```
-AI 执行 SSH/登录 → 连接成功 → 自动调用 mnemosyne save → 记录账号信息
-```
-
-### 记录格式
-
-```json
-{
-  "content": "SSH 10.0.0.35 | user: root | auth: password | status: active",
-  "kind": "fact",
-  "tags": ["credential", "ssh", "10.0.0.35", "root"],
-  "importance": 0.85
-}
-```
-
-### 记录内容
-
-| 字段 | 说明 | 示例 |
-|------|------|------|
-| 设备名称 | 主机名或描述 | hermes-server, mac-mini, nas |
-| IP 地址 | 设备 IP | 10.0.0.35 |
-| 用户名 | 登录账号 | root, dension, admin |
-| 认证方式 | password / key / token | password |
-| 密钥路径 | 如果是密钥认证 | ~/.ssh/id_rsa |
-| 系统信息 | OS, 架构 | Ubuntu 24.04 x86_64 |
-
-### AI 行为规范
-
-**登录成功后，AI 必须执行：**
-
-```python
-# 登录成功，记录到账号库
-mnemosyne("save", token, 
-    content=f"SSH {ip} | user: {user} | auth: {auth_method} | {hostname} | {os_info}",
-    kind="fact",
-    importance=0.85,
-    tags=["credential", "ssh", ip, user, hostname]
-)
-```
-
-**下次登录时，AI 应该先查账号库：**
-
-```python
-# 连接前先查有没有记录
-result = mnemosyne("search", token, query=f"SSH {ip}", kind="fact", limit=3)
-# 找到 → 直接用记录的凭据
-# 没找到 → 询问用户
-```
-
-### 完整流程示例
+### 记录格式（通用）
 
 ```
-用户: "SSH 到 10.0.0.36 看看"
+{type} {service} | {key_field}: {key_value} | {auth_field}: {auth_value}
+```
 
-AI:
-  1. 先查 Mnemosyne: search "SSH 10.0.0.36"
-     → 找到: "SSH 10.0.0.36 | user: root | auth: password"
-  2. 用记录的凭据尝试连接
-  3. 连接成功 → 什么都不用存（已有记录）
-  4. 连接失败 → 问用户要密码
+### 示例
 
-用户: "root / abc123"
+```
+# SSH
+ssh 10.0.0.35 | user: root | auth: password
+ssh 10.0.0.11 | user: root | auth: key:~/.ssh/dension_10_0_0_11
 
-AI:
-  5. 登录成功
-  6. 自动存储: save "SSH 10.0.0.36 | user: root | auth: password | Ubuntu 24.04"
-  7. 执行用户要求的操作
+# 网站
+web github.com | user: dingdadao | auth: token:ghp_xxx
+web admin.niao.fun | user: admin | auth: password:xxx
+
+# API
+api openai.com | key: sk-xxx | env: OPENAI_API_KEY
+api workbuddy | url: 10.0.0.14:7863 | key_env: WB2A_API_KEY
+
+# 数据库
+db postgres | host: 10.0.0.20 | user: admin | auth: password:xxx
+
+# 服务
+service hermes-gateway | host: 10.0.0.11 | restart: systemctl restart hermes-gateway
+service breeze-tts | host: 10.0.0.29:8010 | type: MLX TTS
 ```
 
 ### 标签约定
 
-所有凭据记录必须有这些标签：
-
 ```
-["credential", 协议, IP, 用户名, 主机名]
+[type, service, host/user, key_field]
 ```
 
-这样搜索时可以用任意维度过滤：
-- `search query="credential SSH"` → 所有 SSH 凭据
-- `search query="credential 10.0.0.35"` → 特定 IP
-- `search query="credential root"` → 所有 root 账号
+例如：
+- `["ssh", "10.0.0.35", "root"]`
+- `["web", "github.com", "dingdadao"]`
+- `["api", "openai", "OPENAI_API_KEY"]`
+- `["service", "hermes-gateway", "10.0.0.11"]`
 
----
+### AI 行为
 
-## 工具接入
+```python
+# 登录成功后自动存
+def on_login_success(service_type, service, **credentials):
+    content = f"{service_type} {service}"
+    for k, v in credentials.items():
+        content += f" | {k}: {v}"
+    mnemosyne("save", token,
+        content=content, kind="fact", importance=0.85,
+        tags=[service_type, service] + list(credentials.keys()))
 
-### DSH (DeepSeekRuntime)
-
-```bash
-git clone --depth 1 https://github.com/dingdadao/Mnemosyne.git /tmp/mn
-DSH_PROFILE=~/.dsh/profiles/desktop
-mkdir -p "$DSH_PROFILE/node_modules/dsh-mnemosyne"
-cp -r /tmp/mn/plugin/* "$DSH_PROFILE/node_modules/dsh-mnemosyne/"
-cd "$DSH_PROFILE" && node -e "
-const fs=require('fs');const pkg=JSON.parse(fs.readFileSync('package.json'));
-pkg.dependencies['dsh-mnemosyne']='file:node_modules/dsh-mnemosyne';
-fs.writeFileSync('package.json',JSON.stringify(pkg,null,2));"
-cat >> cordis.patch.yml << 'EOF'
-- insert:
-    - id: mnemosyne
-      name: 'dsh-mnemosyne'
-      config:
-        mnemosyneUrl: 'YOUR_URL'
-        mnemosyneToken: 'YOUR_TOKEN'
-EOF
+# 下次连接前先查
+def before_connect(service_type, service):
+    r = mnemosyne("search", token, query=f"{service_type} {service}", limit=3)
+    # 找到 → 用记录的凭据
+    # 没找到 → 问用户
 ```
 
-### Hermes
-
-```bash
-git clone --depth 1 https://github.com/dingdadao/Mnemosyne.git /tmp/mn
-HERMES_AGENT=/root/.hermes/hermes-agent
-mkdir -p "$HERMES_AGENT/plugins/memory/mnemosyne"
-cp /tmp/mn/plugins/memory/mnemosyne/* "$HERMES_AGENT/plugins/memory/mnemosyne/"
-echo "MNEMOSYNE_URL=YOUR_URL" >> /root/.hermes/.env
-echo "MNEMOSYNE_TOKEN=YOUR_TOKEN" >> /root/.hermes/.env
-sed -i '/^memory:/a\  provider: mnemosyne' /root/.hermes/config.yaml
-systemctl restart hermes-gateway
-```
-
-### Claude Code / Cursor
-
-```json
-{
-  "mcpServers": {
-    "mnemosyne": {
-      "command": "npx",
-      "args": ["-y", "mnemosyne-mcp"],
-      "env": {
-        "MNEMOSYNE_URL": "YOUR_URL",
-        "MNEMOSYNE_TOKEN": "YOUR_TOKEN"
-      }
-    }
-  }
-}
-```
-
-### 任意自定义工具
+### 通用客户端
 
 ```python
 class MnemosyneClient:
     def __init__(self, url, token, workspace="default"):
-        self.url, self.token, self.workspace = url, token, workspace
+        self.url, self.token, self.ws = url, token, workspace
     
-    def save_credential(self, ip, user, auth, hostname="", os_info="", tags=None):
-        """登录成功后调用"""
-        content = f"SSH {ip} | user: {user} | auth: {auth}"
-        if hostname: content += f" | {hostname}"
-        if os_info: content += f" | {os_info}"
+    def _call(self, method, path, body=None):
+        import json, urllib.request
+        data = json.dumps(body).encode() if body else None
+        req = urllib.request.Request(f"{self.url}{path}", data=data, method=method)
+        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("Content-Type", "application/json")
+        return json.loads(urllib.request.urlopen(req, timeout=10).read())
+    
+    def save_credential(self, cred_type, service, **fields):
+        """登录成功后调用。cred_type: ssh/web/api/db/service"""
+        content = f"{cred_type} {service}"
+        for k, v in fields.items():
+            content += f" | {k}: {v}"
         return self._call("POST", "/memory/save", {
             "content": content, "kind": "fact", "importance": 0.85,
-            "tags": ["credential", "ssh", ip, user, hostname] + (tags or []),
-            "workspace": self.workspace
+            "tags": [cred_type, service] + list(fields.keys()),
+            "workspace": self.ws
         })
     
-    def find_credential(self, ip=None, user=None, hostname=None):
-        """登录前调用"""
-        query = "credential"
-        if ip: query += f" {ip}"
-        if user: query += f" {user}"
-        if hostname: query += f" {hostname}"
+    def find_credential(self, cred_type=None, service=None):
+        """连接前调用"""
+        q = cred_type or ""
+        if service: q += f" {service}"
         return self._call("POST", "/memory/search", {
-            "query": query, "kind": "fact", "limit": 5, "workspace": self.workspace
+            "query": q, "kind": "fact", "limit": 5, "workspace": self.ws
         })
+    
+    def save_memory(self, content, kind="fact", importance=0.5, tags=None):
+        return self._call("POST", "/memory/save", {
+            "content": content, "kind": kind, "importance": importance,
+            "tags": tags or [], "workspace": self.ws
+        })
+    
+    def search(self, query, limit=10):
+        return self._call("POST", "/memory/search", {
+            "query": query, "limit": limit, "workspace": self.ws
+        })
+
+# 用法
+c = MnemosyneClient("https://mnemosyne.niao.fun", "YOUR_TOKEN")
+
+# SSH 登录成功后
+c.save_credential("ssh", "10.0.0.35", user="root", auth="password:xxx")
+
+# 网站登录成功后
+c.save_credential("web", "github.com", user="dingdadao", auth="token:ghp_xxx")
+
+# API 配置
+c.save_credential("api", "openai", key="sk-xxx", env="OPENAI_API_KEY")
+
+# 服务信息
+c.save_credential("service", "breeze-tts", host="10.0.0.29:8010", type="MLX")
+
+# 查找
+c.find_credential("ssh", "10.0.0.35")
+c.find_credential("web", "github.com")
 ```
 
 ---
 
-## API 参考
+## API
 
 ```
-POST   /memory/save       — 保存（自动脱敏）
+POST   /memory/save       — 保存
 POST   /memory/search     — BM25 搜索
-GET    /memory/recent     — 最近记忆
-GET    /memory/timeline   — 时间轴
-POST   /memory/dream      — autoDream 整理
-GET    /memory/health     — 健康检查
+GET    /memory/recent     — 最近
+POST   /memory/dream      — 整理
+GET    /memory/health     — 健康
 ```
 
 ---
 
-*Mnemosyne — 记忆女神。一个协议，所有工具共享记忆。*
+*Mnemosyne — 记忆女神。一个协议，所有工具共享。*
