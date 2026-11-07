@@ -440,6 +440,23 @@ class MnemosyneProvider(MemoryProvider):
                 if not r["success"]: return json.dumps(r)
                 d = r["data"]
                 return json.dumps({"success": True, "result": f"Dream [{ws}]: merged={d.get('duplicates_merged',0)}, summarized={d.get('memories_summarized',0)}"})
+            elif action == "recent":
+                r = self._api("GET", f"/memory/recent?workspace={ws}&limit={args.get('limit', 10)}")
+                if not r["success"]: return json.dumps(r)
+                results = r["data"].get("results", [])
+                if not results: return json.dumps({"success": True, "result": f"No recent memories in [{ws}]"})
+                lines = [f"Recent {len(results)} in [{ws}]:"]
+                for m in results:
+                    lines.append(f"  [{m.get('kind','?')}] {(m.get('content') or '')[:80]}")
+                return json.dumps({"success": True, "result": "\n".join(lines)}, ensure_ascii=False)
+            elif action == "stats":
+                r = self._api("GET", f"/memory/stats/detailed?workspace={ws}")
+                if not r["success"]: return json.dumps(r)
+                d = r["data"]
+                lines = [f"Stats [{ws}]: {d.get('recent_7d', 0)} recent (7d)"]
+                for k in d.get("by_kind", []):
+                    lines.append(f"  {k.get('kind','?')}: {k.get('count',0)}")
+                return json.dumps({"success": True, "result": "\n".join(lines)}, ensure_ascii=False)
             else:
                 return json.dumps({"success": False, "error": f"Unknown action: {action}"})
         except Exception as e:
