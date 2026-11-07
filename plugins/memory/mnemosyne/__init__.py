@@ -1,15 +1,17 @@
 """
-Mnemosyne Memory Provider for Hermes Agent
+Mnemosyne Memory Provider for Hermes Agent v2
 Cross-device centralized memory via Mnemosyne server.
 
-Place in: plugins/memory/mnemosyne/__init__.py
-Activate: set memory.provider=mnemosyne in config.yaml
-Config:   MNEMOSYNE_URL, MNEMOSYNE_TOKEN in .env
+v2 changes:
+- sync_turn: only save on explicit "记住/remember/save" commands, not every turn
+- prefetch: importance filter + higher limit + better truncation
+- on_memory_write: sync built-in MEMORY.md writes to Mnemosyne
 """
 
 import json
 import logging
 import os
+import re
 import threading
 import urllib.request
 import urllib.error
@@ -22,11 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class MnemosyneProvider(MemoryProvider):
-    """Mnemosyne cross-device memory provider.
-    
-    Auto-recall via prefetch(), auto-save via sync_turn().
-    Agent doesn't need to know Mnemosyne exists.
-    """
+    """Mnemosyne cross-device memory provider v2."""
 
     def __init__(self):
         self._url = ""
@@ -34,18 +32,18 @@ class MnemosyneProvider(MemoryProvider):
         self._workspace = "default"
         self._session_id = ""
         self._hermes_home = ""
-        self._pending_turns = []
+        self._pending_saves = []
         self._sync_thread = None
         self._last_prefetch = ""
         self._prefetch_cache = {}
         self._sync_lock = threading.Lock()
+        self._save_count = 0
 
     @property
     def name(self) -> str:
         return "mnemosyne"
 
     def is_available(self) -> bool:
-        """Check if MNEMOSYNE_TOKEN is configured. No network calls."""
         token = os.environ.get("MNEMOSYNE_TOKEN", "")
         if token:
             return True
@@ -64,14 +62,11 @@ class MnemosyneProvider(MemoryProvider):
         return "MNEMOSYNE_TOKEN not set. Add to .env: MNEMOSYNE_URL=..., MNEMOSYNE_TOKEN=..."
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        """Called once at agent startup."""
         self._session_id = session_id
         self._hermes_home = kwargs.get("hermes_home", str(Path.home() / ".hermes"))
-
         self._url = os.environ.get("MNEMOSYNE_URL", "https://mnemosyne.niao.fun")
         self._token = os.environ.get("MNEMOSYNE_TOKEN", "")
         self._workspace = os.environ.get("MNEMOSYNE_WS", "default")
-
         self._load_env()
 
         config_path = Path(self._hermes_home) / "mnemosyne.json"
@@ -85,10 +80,8 @@ class MnemosyneProvider(MemoryProvider):
             except Exception as e:
                 logger.warning("Failed to load mnemosyne.json: %s", e)
 
-        logger.info(
-            "Mnemosyne provider initialized: url=%s, workspace=%s, session=%s",
-            self._url, self._workspace, session_id[:20]
-        )
+        logger.info("Mnemosyne v2 initialized: url=%s, ws=%s, session=%s",
+                     self._url, self._workspace, session_id[:20])
 
     def _load_env(self):
         if self._token:
@@ -124,40 +117,78 @@ class MnemosyneProvider(MemoryProvider):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    # === Recall ===
+    # === RECALL ===
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Auto-recall: search Mnemosyne before each turn."""
+        """Auto-recall with quality filter. Only inject high-relevance memories."""
         from agent.memory_provider import is_trivial_prompt
         if is_trivial_prompt(query):
             return ""
 
-        cache_key = f"{session_id}:{query[:50]}"
+        cache_key = f"{session_id}:{query[:60]}"
         if cache_key in self._prefetch_cache:
             cached = self._prefetch_cache[cache_key]
             self._last_prefetch = cached
             return cached
 
+        # Skip very short queries
+        if len(query.strip()) < 4:
+            return ""
+
         try:
+            # Search with higher limit, filter by importance
             r = self._api("POST", "/memory/search", {
-                "query": query, "limit": 3, "workspace": self._workspace,
+                "query": query, "limit": 8, "workspace": self._workspace,
             })
             if not r["success"]:
                 return ""
+            
             results = r["data"].get("results", [])
             if not results:
                 return ""
 
-            lines = [f"[Mnemosyne — {len(results)} relevant memories]"]
+            # Filter: only include memories with importance >= 0.5
+            # and content actually related to query
+            filtered = []
+            query_words = set(query.lower().split())
+            
             for m in results:
+                imp = m.get("importance", 0.5)
+                content = m.get("content", "").lower()
+                
+                # Must have decent importance
+                if imp < 0.4:
+                    continue
+                
+                # Check relevance: at least 1 query word in content
+                has_match = any(w in content for w in query_words if len(w) > 1)
+                if not has_match:
+                    continue
+                
+                filtered.append(m)
+            
+            # Take top 3 after filtering
+            filtered = filtered[:3]
+            if not filtered:
+                return ""
+
+            lines = [f"[Mnemosyne — {len(filtered)} relevant memories]"]
+            for m in filtered:
                 kind = m.get("kind", "?")
-                text = (m.get("summary") or m.get("content", ""))[:150]
-                lines.append(f"  [{kind}] {text}")
+                imp = m.get("importance", 0.5)
+                summary = m.get("summary", "")
+                content = m.get("content", "")
+                # Use summary if available, otherwise truncate content
+                text = summary if summary else content[:200]
+                if len(text) > 200:
+                    text = text[:200] + "..."
+                lines.append(f"  [{kind}|{imp:.1f}] {text}")
 
             block = "\n".join(lines)
             self._prefetch_cache[cache_key] = block
             self._last_prefetch = block
             return block
+            
         except Exception as e:
             logger.debug("Mnemosyne prefetch error: %s", e)
             return ""
@@ -165,8 +196,7 @@ class MnemosyneProvider(MemoryProvider):
     def recall_status(self):
         from agent.memory_provider import RecallStatus
         if self._last_prefetch:
-            count = self._last_prefetch.count("[")
-            return RecallStatus(provider_label="Mnemosyne", count=max(count - 1, 1))
+            return RecallStatus(provider_label="Mnemosyne", count=1)
         return None
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -177,100 +207,177 @@ class MnemosyneProvider(MemoryProvider):
                 pass
         spawn_context_thread(_do, name="mnemosyne-prefetch").start()
 
-    # === Store ===
+    # === STORE: Only save on explicit commands ===
 
     def sync_turn(self, user_content, assistant_content, *,
                   session_id="", messages=None, turn_author=None, **kwargs):
-        """Auto-save: persist completed turn to Mnemosyne. Non-blocking."""
+        """Only save when user explicitly asks to remember something.
+        Does NOT save every turn as raw chat log."""
+        
+        user = (user_content or "").strip()
+        
+        # Check for explicit remember commands
+        remember_keywords = [
+            "记住", "记下来", "备忘", "记一下",
+            "remember", "save this", "note that", "take note",
+            "记住这个", "记一下这个", "帮我记住", "别忘记",
+        ]
+        
+        is_explicit_remember = any(kw in user.lower() for kw in remember_keywords)
+        
+        # Also save important decisions/errors even without explicit command
+        decision_keywords = ["我决定", "最终方案", "最终选择", "确定了", "就这么定了"]
+        error_keywords = ["报错", "错误", "失败了", "解决方法", "修复了"]
+        
+        is_decision = any(kw in user for kw in decision_keywords)
+        is_error_solution = any(kw in user for kw in error_keywords)
+        
+        if not (is_explicit_remember or is_decision or is_error_solution):
+            return  # Skip ordinary conversation
+        
+        # Determine kind and importance
+        if is_explicit_remember:
+            kind = "fact"
+            importance = 0.75
+        elif is_decision:
+            kind = "decision"
+            importance = 0.85
+        else:
+            kind = "error"
+            importance = 0.7
+        
+        # Extract the actual content to remember (not raw chat log)
+        content = user
+        # If user says "记住 xxx", extract xxx
+        for kw in remember_keywords:
+            if kw in user:
+                idx = user.index(kw) + len(kw)
+                content = user[idx:].strip().strip("：:，,。.")
+                if content:
+                    break
+        
+        if not content:
+            content = user[:300]
+        
+        # Queue for async save
         with self._sync_lock:
-            self._pending_turns.append({
-                "user": user_content[:500],
-                "assistant": assistant_content[:1000],
+            self._pending_saves.append({
+                "content": content,
+                "kind": kind,
+                "importance": importance,
+                "tags": ["explicit-save" if is_explicit_remember else "auto-detect"],
                 "session_id": session_id or self._session_id,
-                "timestamp": __import__("time").time(),
             })
-
+        
         if self._sync_thread and self._sync_thread.is_alive():
             return
-        self._sync_thread = spawn_context_thread(self._flush_pending, name="mnemosyne-sync")
+        self._sync_thread = spawn_context_thread(self._flush_saves, name="mnemosyne-save")
         self._sync_thread.start()
 
-    def _flush_pending(self):
+    def _flush_saves(self):
         with self._sync_lock:
-            turns = self._pending_turns[:]
-            self._pending_turns.clear()
-
-        for turn in turns:
+            saves = self._pending_saves[:]
+            self._pending_saves.clear()
+        
+        for item in saves:
             try:
-                user = turn["user"].strip()
-                if len(user) < 5:
-                    continue
-
-                kind = "episode"
-                importance = 0.4
-                if any(kw in user for kw in ["记住", "remember", "保存"]):
-                    kind, importance = "fact", 0.7
-                elif any(kw in user for kw in ["决定", "选定", "decision"]):
-                    kind, importance = "decision", 0.8
-                elif any(kw in user for kw in ["错误", "失败", "error", "failed"]):
-                    kind, importance = "error", 0.7
-                elif any(kw in user for kw in ["部署", "配置", "步骤", "流程"]):
-                    kind, importance = "procedure", 0.6
-
-                content = f"User: {turn['user']}\nAssistant: {turn['assistant'][:300]}"
                 self._api("POST", "/memory/save", {
-                    "content": content, "kind": kind,
-                    "tags": ["auto-sync", "hermes", f"session:{turn['session_id'][:12]}"],
-                    "importance": importance, "workspace": self._workspace,
-                    "source_agent": "hermes-auto", "source_session": turn["session_id"],
+                    "content": item["content"],
+                    "kind": item["kind"],
+                    "importance": item["importance"],
+                    "tags": item["tags"],
+                    "workspace": self._workspace,
+                    "source_agent": "hermes-v2",
+                    "source_session": item["session_id"],
                 })
+                self._save_count += 1
+                logger.info("Mnemosyne saved: [%s] %s...", item["kind"], item["content"][:50])
             except Exception as e:
-                logger.debug("Mnemosyne sync error: %s", e)
+                logger.debug("Mnemosyne save error: %s", e)
+
+    # === Sync built-in memory writes to Mnemosyne ===
+
+    def on_memory_write(self, action: str, target: str, content: str, 
+                        metadata: Optional[dict] = None) -> None:
+        """When built-in MEMORY.md/USER.md is written, sync to Mnemosyne."""
+        if not content or len(content) < 10:
+            return
+        
+        # Don't sync every small edit, only substantial entries
+        if len(content) < 20:
+            return
+        
+        kind = "preference" if target == "user" else "fact"
+        
+        def _sync():
+            try:
+                self._api("POST", "/memory/save", {
+                    "content": content[:500],
+                    "kind": kind,
+                    "importance": 0.65,
+                    "tags": ["memory-sync", target],
+                    "workspace": self._workspace,
+                    "source_agent": "hermes-memory-sync",
+                    "source_session": self._session_id,
+                })
+            except Exception:
+                pass
+        
+        spawn_context_thread(_sync, name="mnemosyne-mem-sync").start()
+
+    # === Session lifecycle ===
 
     def on_session_end(self, messages: list) -> None:
-        """Final save at session end."""
-        if self._pending_turns:
-            self._flush_pending()
+        if self._pending_saves:
+            self._flush_saves()
+        
+        # Save a brief session summary (not raw logs)
         if not messages:
             return
+        
         try:
             user_msgs = [m for m in messages if m.get("role") == "user"]
-            asst_msgs = [m for m in messages if m.get("role") == "assistant"]
             if not user_msgs:
                 return
-
-            summary = f"Session: {len(user_msgs)} user, {len(asst_msgs)} assistant messages."
+            
+            # Extract just the topics, not full messages
             topics = []
-            for m in user_msgs[:5]:
+            for m in user_msgs[-5:]:
                 c = m.get("content", "")
-                if isinstance(c, str) and len(c) > 10:
-                    topics.append(c[:80])
-            if topics:
-                summary += "\nTopics:\n" + "\n".join(f"  - {t}" for t in topics)
-
+                if isinstance(c, str) and len(c) > 5:
+                    topics.append(c[:60])
+            
+            if not topics:
+                return
+            
+            summary = f"Session topics: " + "; ".join(topics)
+            
             self._api("POST", "/memory/save", {
-                "content": summary, "kind": "episode",
-                "tags": ["session-summary", "auto", "hermes"],
-                "importance": 0.5, "workspace": self._workspace,
-                "source_agent": "hermes-session-end", "source_session": self._session_id,
+                "content": summary,
+                "kind": "episode",
+                "tags": ["session-end", "auto"],
+                "importance": 0.4,
+                "workspace": self._workspace,
+                "source_agent": "hermes-session-end",
+                "source_session": self._session_id,
             })
         except Exception as e:
-            logger.warning("Mnemosyne on_session_end error: %s", e)
+            logger.debug("on_session_end error: %s", e)
 
     def on_pre_compress(self, messages: list) -> str:
-        """Preserve key facts before context compression."""
+        """Extract key facts before context compression."""
         try:
-            key_facts = []
+            facts = []
             for m in messages:
                 if m.get("role") == "assistant":
                     c = m.get("content", "")
                     if isinstance(c, str):
-                        for kw in ["决定", "选定", "部署成功", "错误", "失败"]:
+                        for kw in ["决定", "选定", "最终方案", "部署成功"]:
                             if kw in c:
-                                key_facts.append(c[:200])
+                                facts.append(c[:150])
                                 break
-            if key_facts:
-                return f"[Mnemosyne: {len(key_facts)} key facts]\n" + "\n".join(key_facts[:3])
+            if facts:
+                return f"[Mnemosyne: {len(facts)} key facts]\n" + "\n".join(facts[:2])
         except Exception:
             pass
         return ""
@@ -280,7 +387,7 @@ class MnemosyneProvider(MemoryProvider):
     def get_tool_schemas(self) -> list:
         return [{
             "name": "mnemosyne",
-            "description": "Cross-device centralized memory. Actions: save, search, recent, health, dream, stats.",
+            "description": "Cross-device memory. Actions: save, search, recent, health, dream, stats.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -327,7 +434,7 @@ class MnemosyneProvider(MemoryProvider):
                 r = self._api("GET", f"/memory/health?workspace={ws}")
                 if not r["success"]: return json.dumps(r)
                 d = r["data"]
-                return json.dumps({"success": True, "result": f"Health [{ws}]: {d.get('score',0)}/100, {d.get('total',0)} memories, {d.get('duplicates',0)} dupes"})
+                return json.dumps({"success": True, "result": f"Health [{ws}]: {d.get('score',0)}/100, {d.get('total',0)} memories"})
             elif action == "dream":
                 r = self._api("POST", "/memory/dream", {"workspace": ws})
                 if not r["success"]: return json.dumps(r)
@@ -355,10 +462,9 @@ class MnemosyneProvider(MemoryProvider):
         config_path.write_text(json.dumps(config, indent=2))
 
     def shutdown(self) -> None:
-        if self._pending_turns:
-            self._flush_pending()
+        if self._pending_saves:
+            self._flush_saves()
 
 
 def register(ctx) -> None:
-    """Plugin entry point."""
     ctx.register_memory_provider(MnemosyneProvider())
