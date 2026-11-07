@@ -64,7 +64,7 @@ class MnemosyneProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
         self._hermes_home = kwargs.get("hermes_home", str(Path.home() / ".hermes"))
-        self._url = os.environ.get("MNEMOSYNE_URL", "https://mnemosyne.niao.fun")
+        self._url = os.environ.get("MNEMOSYNE_URL", "")
         self._token = os.environ.get("MNEMOSYNE_TOKEN", "")
         self._workspace = os.environ.get("MNEMOSYNE_WS", "default")
         self._load_env()
@@ -436,7 +436,7 @@ class MnemosyneProvider(MemoryProvider):
 
     def get_config_schema(self) -> list:
         return [
-            {"key": "url", "description": "Mnemosyne server URL", "default": "https://mnemosyne.niao.fun"},
+            {"key": "url", "description": "Mnemosyne server URL", "default": ""},
             {"key": "token", "description": "Mnemosyne API token", "secret": True, "required": True, "env_var": "MNEMOSYNE_TOKEN"},
             {"key": "workspace", "description": "Default workspace", "default": "default"},
         ]
