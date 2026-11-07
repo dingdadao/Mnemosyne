@@ -328,41 +328,13 @@ class MnemosyneProvider(MemoryProvider):
     # === Session lifecycle ===
 
     def on_session_end(self, messages: list) -> None:
+        """Only flush pending saves. Do NOT auto-save session summaries."""
         if self._pending_saves:
             self._flush_saves()
-        
-        # Save a brief session summary (not raw logs)
-        if not messages:
-            return
-        
-        try:
-            user_msgs = [m for m in messages if m.get("role") == "user"]
-            if not user_msgs:
-                return
-            
-            # Extract just the topics, not full messages
-            topics = []
-            for m in user_msgs[-5:]:
-                c = m.get("content", "")
-                if isinstance(c, str) and len(c) > 5:
-                    topics.append(c[:60])
-            
-            if not topics:
-                return
-            
-            summary = f"Session topics: " + "; ".join(topics)
-            
-            self._api("POST", "/memory/save", {
-                "content": summary,
-                "kind": "episode",
-                "tags": ["session-end", "auto"],
-                "importance": 0.4,
-                "workspace": self._workspace,
-                "source_agent": "hermes-session-end",
-                "source_session": self._session_id,
-            })
-        except Exception as e:
-            logger.debug("on_session_end error: %s", e)
+        # Intentionally NOT saving session summaries to Mnemosyne.
+        # Session topic dumps pollute the memory store with low-value data.
+        # If a session had important content, it should have been captured
+        # by explicit "记住" commands or on_memory_write sync during the session.
 
     def on_pre_compress(self, messages: list) -> str:
         """Extract key facts before context compression."""
