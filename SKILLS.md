@@ -242,3 +242,22 @@ MNEMOSYNE_OWNER=dingshuangdao
 ```
 
 各 profile 设置不同的 MNEMOSYNE_OWNER 实现多用户隔离。
+
+---
+
+## 客户端兼容性
+
+| 工具 | 接入方式 | 自动召回 | 自动保存 | 多账户 | 说明 |
+|------|---------|---------|---------|--------|------|
+| DSH | 插件 | ✅ 预测式 | ✅ 显式时 | ✅ | 完整支持 |
+| Hermes | MemoryProvider | ✅ prefetch | ✅ sync_turn | ✅ | 完整支持 |
+| Claude Code | MCP | ❌ 手动 | ❌ 手动 | ✅ 参数 | 需手动调工具 |
+| Cursor | MCP | ❌ 手动 | ❌ 手动 | ✅ 参数 | 需手动调工具 |
+| 豆包 | HTTP | ❌ 手动 | ❌ 手动 | ✅ 参数 | 无 hook 支持 |
+| 龙虾 | HTTP | ❌ 手动 | ❌ 手动 | ✅ 参数 | 无 hook 支持 |
+| WorkBuddy | HTTP | ❌ 手动 | ❌ 手动 | ✅ 参数 | 无 hook 支持 |
+| 任意工具 | HTTP | ❌ 手动 | ❌ 手动 | ✅ 参数 | 有 HTTP 即可 |
+
+**关键区别**：
+- **有 hook 的系统**（DSH、Hermes）：自动召回 + 自动保存
+- **无 hook 的系统**（豆包、龙虾等）：只能手动调 API，但数据完全共享
