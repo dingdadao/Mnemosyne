@@ -1,0 +1,8 @@
+name: mnemosyne
+version: 1.0.0
+description: "Cross-device centralized memory via Mnemosyne server. Auto-recall on prefetch, auto-save on sync_turn, session-end summary."
+hooks:
+  - prefetch
+  - sync_turn
+  - on_session_end
+  - on_pre_compress
