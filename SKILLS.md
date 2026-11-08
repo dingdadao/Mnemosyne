@@ -310,3 +310,34 @@ DELETE /memory/delete?id=mem_xxx
 - 主 token 哈希 === TOKEN_HASH → 通过，身份 admin
 - 否则查 owner_tokens 表 → 通过，身份为表里的 owner
 - 都不匹配 → 401
+
+---
+
+## Hermes provider 工具名
+
+provider 暴露的工具名为 **`mnemo`**，不是 `mnemosyne`。
+
+原因：Hermes 核心保留 `mnemosyne` 作为工具名，注册时会被静默忽略：
+```
+WARNING Memory provider 'mnemosyne' tool 'mnemosyne' shadows a reserved core tool name; registration ignored.
+```
+`registered (1 tools)` 是注册前计数，实际可用工具数是 0。
+
+调用方式：
+```python
+mnemo(action="search", query="...", owner="dingshuangdao", include=["own","shared"])
+mnemo(action="save", content="...", owner="...", visibility="private")
+```
+
+provider 本身的 `name` property 仍是 `mnemosyne`（Provider 标识），不影响工具注册。
+
+## prefetch 调试
+
+provider 在以下每个早退分支都有 `logger.debug("mnemo: prefetch ...")`：
+- trivial prompt / query < 4 字符
+- cache hit
+- API 失败 / 服务端无结果
+- 相关性过滤后为空
+- 成功返回（带条数和字符数）
+
+`recall_status()` 从 `_last_prefetch` 首行解析真实条数（`N relevant memories`），不再硬编码 1。
