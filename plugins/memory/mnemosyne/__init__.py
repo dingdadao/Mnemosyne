@@ -127,14 +127,17 @@ class MnemosyneProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         from agent.memory_provider import is_trivial_prompt
         if is_trivial_prompt(query):
+            logger.debug("mnemo: prefetch skipped (trivial prompt)")
             return ""
         if len(query.strip()) < 4:
+            logger.debug("mnemo: prefetch skipped (query < 4 chars)")
             return ""
 
         cache_key = f"{session_id}:{self._owner}:{query[:60]}"
         if cache_key in self._prefetch_cache:
             cached = self._prefetch_cache[cache_key]
             self._last_prefetch = cached
+            logger.debug("mnemo: prefetch cache hit (%d chars)", len(cached))
             return cached
 
         try:
@@ -144,10 +147,12 @@ class MnemosyneProvider(MemoryProvider):
                 "workspace": self._workspace,
             })
             if not r["success"]:
+                logger.debug("mnemo: prefetch api failed: %s", r.get("error"))
                 return ""
             
             results = r["data"].get("results", [])
             if not results:
+                logger.debug("mnemo: prefetch no results from server")
                 return ""
 
             filtered = []
@@ -171,8 +176,10 @@ class MnemosyneProvider(MemoryProvider):
                     continue
                 filtered.append(m)
             
+            logger.debug("mnemo: prefetch %d/%d survived relevance filter", len(filtered), len(results))
             filtered = filtered[:3]
             if not filtered:
+                logger.debug("mnemo: prefetch empty after filtering")
                 return ""
 
             # v3: show owner in recall
@@ -191,16 +198,20 @@ class MnemosyneProvider(MemoryProvider):
             block = "\n".join(lines)
             self._prefetch_cache[cache_key] = block
             self._last_prefetch = block
+            logger.debug("mnemo: prefetch returned %d memories (%d chars)", len(filtered), len(block))
             return block
             
         except Exception as e:
-            logger.debug("prefetch error: %s", e)
+            logger.debug("mnemo: prefetch exception: %s", e)
             return ""
 
     def recall_status(self):
         from agent.memory_provider import RecallStatus
         if self._last_prefetch:
-            return RecallStatus(provider_label="Mnemosyne", count=1)
+            first = self._last_prefetch.split("\n", 1)[0]
+            m = re.search(r"(\d+)\s+relevant memories", first)
+            count = int(m.group(1)) if m else 0
+            return RecallStatus(provider_label="Mnemosyne", count=count)
         return None
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -330,7 +341,7 @@ class MnemosyneProvider(MemoryProvider):
 
     def get_tool_schemas(self) -> list:
         return [{
-            "name": "mnemosyne",
+            "name": "mnemo",
             "description": "Cross-device memory with owner isolation. Actions: save, search, recent, health, dream, stats.",
             "parameters": {
                 "type": "object",
@@ -351,7 +362,7 @@ class MnemosyneProvider(MemoryProvider):
         }]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
-        if tool_name != "mnemosyne":
+        if tool_name != "mnemo":
             raise NotImplementedError(f"Unknown tool: {tool_name}")
         action = args.get("action", "")
         ws = args.get("workspace") or self._workspace
