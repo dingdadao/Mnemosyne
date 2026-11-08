@@ -17,6 +17,26 @@ from agent.memory_provider import MemoryProvider, spawn_context_thread
 
 logger = logging.getLogger(__name__)
 
+# Config level is INFO, so logger.debug() never reaches the log file. Prefetch tracing
+# prints via a filtered logger at INFO level, gated by MNEMO_TRACE=1 in the profile .env.
+_TRACE = logging.getLogger("mnemo.trace")
+_TRACE.propagate = False
+_TRACE.setLevel(logging.INFO)
+if os.environ.get("MNEMO_TRACE", "").strip() in ("1", "true", "yes"):
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [mnemo] %(message)s"))
+    _TRACE.addHandler(_handler)
+    _TRACE.disabled = False
+else:
+    _TRACE.disabled = True
+
+
+def _trace(msg: str, *args) -> None:
+    """Prefetch path tracing; silent unless MNEMO_TRACE=1."""
+    if not _TRACE.disabled:
+        _TRACE.info(msg, *args)
+
+
 
 class MnemosyneProvider(MemoryProvider):
     """Mnemosyne cross-device memory provider v3 with multi-tenant support."""
@@ -62,8 +82,11 @@ class MnemosyneProvider(MemoryProvider):
         self._session_id = session_id
         self._hermes_home = kwargs.get("hermes_home", str(Path.home() / ".hermes"))
         
-        # v3: owner from kwargs (user_id) or env
-        self._owner = kwargs.get("user_id") or os.environ.get("MNEMOSYNE_OWNER", "default")
+        # owner priority: explicit config (mnemosyne.json) > MNEMOSYNE_OWNER env > platform user_id.
+        # The gateway injects its own IM user_id (a platform hash) into initialize(); letting it win
+        # silently rebinds every profile to an owner that holds no memories. Per-profile tenant
+        # isolation is the profile's .env, so the configured owner must outrank the platform id.
+        self._owner = os.environ.get("MNEMOSYNE_OWNER") or kwargs.get("user_id") or "default"
         self._include = os.environ.get("MNEMOSYNE_INCLUDE", "own,shared").split(",")
         
         self._url = os.environ.get("MNEMOSYNE_URL", "")
@@ -125,66 +148,59 @@ class MnemosyneProvider(MemoryProvider):
     # === RECALL ===
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """Auto-recall. Trusts the server's BM25 ranking — no client-side
+        hard substring filter (that silently dropped valid CJK results).
+        """
+        import time as _time
         from agent.memory_provider import is_trivial_prompt
-        if is_trivial_prompt(query):
-            logger.debug("mnemo: prefetch skipped (trivial prompt)")
+
+        q = (query or "").strip()
+        if is_trivial_prompt(q):
+            _trace("prefetch skipped (trivial prompt)")
             return ""
-        if len(query.strip()) < 4:
-            logger.debug("mnemo: prefetch skipped (query < 4 chars)")
+        if len(q) < 2:
+            _trace("prefetch skipped (query < 2 chars)")
             return ""
 
-        cache_key = f"{session_id}:{self._owner}:{query[:60]}"
-        if cache_key in self._prefetch_cache:
-            cached = self._prefetch_cache[cache_key]
-            self._last_prefetch = cached
-            logger.debug("mnemo: prefetch cache hit (%d chars)", len(cached))
-            return cached
+        cache_key = f"{session_id}:{self._owner}:{q[:60]}"
+        cached = self._prefetch_cache.get(cache_key)
+        if cached:
+            block, ts = cached
+            # v3.1: TTL so newly saved memories become visible
+            if _time.time() - ts < 60:
+                self._last_prefetch = block
+                _trace("prefetch cache hit (%d chars)", len(block))
+                return block
+            else:
+                self._prefetch_cache.pop(cache_key, None)
 
         try:
             r = self._api("POST", "/memory/search", {
-                "query": query, "limit": 8,
+                "query": q, "limit": 8,
                 "owner": self._owner, "include": self._include,
                 "workspace": self._workspace,
             })
             if not r["success"]:
-                logger.debug("mnemo: prefetch api failed: %s", r.get("error"))
+                _trace("prefetch api failed: %s", r.get("error"))
                 return ""
-            
+
             results = r["data"].get("results", [])
             if not results:
-                logger.debug("mnemo: prefetch no results from server")
+                _trace("prefetch no results from server")
                 return ""
 
-            filtered = []
-            q = query.strip().lower()
-            # Chinese has no word separators, so split() leaves one giant token and the
-            # substring test below can never match anything real. Build the probe set from
-            # whitespace tokens PLUS CJK character bigrams so partial matches survive.
-            query_words = {w for w in q.split() if len(w) > 1}
-            cjk = "".join(ch for ch in q if "\u4e00" <= ch <= "\u9fff")
-            if len(cjk) >= 2:
-                query_words |= {cjk[i:i + 2] for i in range(len(cjk) - 1)}
-            if not query_words:
-                query_words = {q} if q else set()
-
-            for m in results:
-                imp = m.get("importance", 0.5)
-                if imp < 0.4:
-                    continue
-                content = (m.get("content") or "").lower()
-                if not any(w in content for w in query_words):
-                    continue
-                filtered.append(m)
-            
-            logger.debug("mnemo: prefetch %d/%d survived relevance filter", len(filtered), len(results))
-            filtered = filtered[:3]
-            if not filtered:
-                logger.debug("mnemo: prefetch empty after filtering")
+            # Server already BM25-ranked by relevance. Keep a light importance
+            # floor only; do NOT require query bigrams to appear in content —
+            # that made every Chinese recall block empty.
+            kept = [m for m in results if (m.get("importance") or 0.5) >= 0.4]
+            _trace("prefetch %d/%d passed importance floor", len(kept), len(results))
+            kept = kept[:3]
+            if not kept:
+                _trace("prefetch empty after floor")
                 return ""
 
-            # v3: show owner in recall
-            lines = [f"[Mnemosyne — {len(filtered)} relevant memories]"]
-            for m in filtered:
+            lines = [f"[Mnemosyne — {len(kept)} relevant memories]"]
+            for m in kept:
                 kind = m.get("kind", "?")
                 imp = m.get("importance", 0.5)
                 owner = m.get("owner", "?")
@@ -196,13 +212,13 @@ class MnemosyneProvider(MemoryProvider):
                 lines.append(f"  [{kind}|{imp:.1f}|{owner}] {text}")
 
             block = "\n".join(lines)
-            self._prefetch_cache[cache_key] = block
+            self._prefetch_cache[cache_key] = (block, _time.time())
             self._last_prefetch = block
-            logger.debug("mnemo: prefetch returned %d memories (%d chars)", len(filtered), len(block))
+            _trace("prefetch returned %d memories (%d chars)", len(kept), len(block))
             return block
-            
+
         except Exception as e:
-            logger.debug("mnemo: prefetch exception: %s", e)
+            _trace("prefetch exception: %s", e)
             return ""
 
     def recall_status(self):
