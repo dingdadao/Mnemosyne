@@ -28,7 +28,7 @@ function getArg(name, defaultVal) {
 const PORT = parseInt(getArg('port', process.env.MNEMOSYNE_PORT || '8790'));
 const HOST = getArg('host', process.env.MNEMOSYNE_HOST || '0.0.0.0');
 const DATA_DIR = getArg('data-dir', process.env.MNEMOSYNE_DATA_DIR || join(homedir(), '.mnemosyne'));
-const RATE_LIMIT_MAX = parseInt(getArg('rate-limit', process.env.MNEMOSYNE_RATE_LIMIT || '600')); // requests per window
+const RATE_LIMIT_MAX = parseInt(getArg('rate-limit', process.env.MNEMOSYNE_RATE_LIMIT || '2000')); // requests per window
 const RATE_LIMIT_WINDOW = parseInt(getArg('rate-window', '60000')); // ms
 
 // === Auth Token ===

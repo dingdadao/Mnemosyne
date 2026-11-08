@@ -13,7 +13,7 @@ check() {
   else echo "  ❌ $name (expect=$expect got=$got)"; FAIL=$((FAIL+1)); fi
 }
 api() {
-  # 后端限流 600/min（按 token 分桶）；节流避免压测自身把配额打满，429 时退避重试
+  # 后端限流 2000/min（按 token 分桶）；节流避免压测自身把配额打满，429 时退避重试
   sleep 0.4
   local out code
   out=$(curl -s -m 10 -w "\n%{http_code}" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" "$@")

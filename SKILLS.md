@@ -410,7 +410,7 @@ GET /memory/graph?entity=10.0.0.33
 
 ## 限流（v3.2.1）
 
-后端按 **token 分桶**限流，默认 600 次 / 60 秒：
+后端按 **token 分桶**限流，默认 2000 次 / 60 秒：
 
 - 每个 token/设备独立配额，CDN 回源共享 IP 不会互相挤掉
 - 环境变量 `MNEMOSYNE_RATE_LIMIT` 可覆盖；启动参数 `--rate-limit N`
