@@ -28,7 +28,7 @@ function getArg(name, defaultVal) {
 const PORT = parseInt(getArg('port', process.env.MNEMOSYNE_PORT || '8790'));
 const HOST = getArg('host', process.env.MNEMOSYNE_HOST || '0.0.0.0');
 const DATA_DIR = getArg('data-dir', process.env.MNEMOSYNE_DATA_DIR || join(homedir(), '.mnemosyne'));
-const RATE_LIMIT_MAX = parseInt(getArg('rate-limit', '100')); // requests per window
+const RATE_LIMIT_MAX = parseInt(getArg('rate-limit', process.env.MNEMOSYNE_RATE_LIMIT || '600')); // requests per window
 const RATE_LIMIT_WINDOW = parseInt(getArg('rate-window', '60000')); // ms
 
 // === Auth Token ===
@@ -355,16 +355,30 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // Rate limiting
-  if (!checkRateLimit(clientIp)) {
-    res.writeHead(429, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'rate_limited', hint: 'Too many requests' }));
-    return;
-  }
-
-  // Auth check - timing safe
+  // Auth check - timing safe (needed BEFORE rate-limit for per-token bucket)
   const authHeader = req.headers.authorization || '';
   const providedToken = authHeader.replace('Bearer ', '');
+
+  // Rate limiting: bucket by token hash (each device/account gets its own quota),
+  // fall back to IP for unauthenticated requests. Prevents CDN回源共享单IP配额.
+  const rlKey = providedToken
+    ? 'tok:' + createHash('sha256').update(providedToken).digest('hex').slice(0, 16)
+    : 'ip:' + clientIp;
+  if (!checkRateLimit(rlKey)) {
+    const retrySec = Math.ceil(RATE_LIMIT_WINDOW / 1000);
+    res.writeHead(429, {
+      'Content-Type': 'application/json',
+      'Retry-After': String(retrySec),
+    });
+    res.end(JSON.stringify({
+      error: 'rate_limited',
+      hint: 'Too many requests',
+      limit: RATE_LIMIT_MAX,
+      window_seconds: retrySec,
+      retry_after: retrySec,
+    }));
+    return;
+  }
   const providedHash = createHash('sha256').update(providedToken).digest();
   
   // v3: accept master token OR any registered owner token

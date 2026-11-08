@@ -405,3 +405,18 @@ GET /memory/graph?entity=10.0.0.33
 
 15 项断言：服务存活、6 条召回探针（top1 命中）、多账户隔离、score、写入去重、extract、4 个端点、健康分。
 内置 0.4s 节流 + 403 重试（ESA CDN 的 CC 防护会对高频请求临时封禁）。
+
+---
+
+## 限流（v3.2.1）
+
+后端按 **token 分桶**限流，默认 600 次 / 60 秒：
+
+- 每个 token/设备独立配额，CDN 回源共享 IP 不会互相挤掉
+- 环境变量 `MNEMOSYNE_RATE_LIMIT` 可覆盖；启动参数 `--rate-limit N`
+- 超限返回 **429**（不是 403），带 `Retry-After` + `limit` + `window_seconds` + `retry_after`
+- 未认证请求按 IP 分桶
+
+之前误判为 CDN CC 防护：实测公网与内网直连各打 110 次，都在第 ~100 次精确返回 429，
+与后端 `RATE_LIMIT_MAX=100` 吻合（旧值），且 429 响应体是 `{"error":"rate_limited"}`。
+403 + `server: ESA` 是撞了 429 后高频重试触发的次生 CC 拦截，根因在后端。
