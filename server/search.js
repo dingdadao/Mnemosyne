@@ -290,7 +290,7 @@ export function autoSummarize(content, maxSentences = 3) {
   
   // Split into sentences
   const sentences = content
-    .split(/[。！？.!?\n]/)
+    .split(/[。！？\n]|(?<=[\u4e00-\u9fff])[.!?](?=\s|$)/)
     .map(s => s.trim())
     .filter(s => s.length > 10);
   

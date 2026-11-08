@@ -59,6 +59,75 @@ function canWriteShared(token, visibility) {
   return row.can_write_shared === 1;
 }
 
+// === Evolution helpers (v3.2) ==========================================
+
+// Opt-in: distill "User: ...\nAssistant: ..." chat text into discrete facts.
+// Pure rules, no LLM. Returns 0-3 short statements.
+function extractFacts(text) {
+  const lines = String(text || '')
+    .split(/\n+/)
+    .map(s => s.replace(/^\s*(User|Assistant|user|assistant)\s*[:：]\s*/, '').trim())
+    .filter(Boolean);
+  const out = [];
+  for (const line of lines) {
+    const sentences = line
+      .split(/[。！？\n]|(?<=[\u4e00-\u9fff])[.!?](?=\s|$)/)
+      .map(s => s.trim())
+      .filter(s => s.length >= 8 && s.length <= 300);
+    for (const s of sentences) {
+      if (/^(好的|明白|收到|我来|让我|请问|谢谢|ok|sure|i will|let me)/i.test(s)) continue;
+      out.push(s);
+    }
+  }
+  return [...new Set(out)].slice(0, 3);
+}
+
+// Lightweight entity extraction: IPs, domains, explicit "service X" / "host: X".
+function autoEntities(text) {
+  const found = new Map();
+  const src = String(text || '');
+  for (const m of src.matchAll(/\b(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?\b/g)) {
+    found.set(m[1], 'host');
+  }
+  for (const m of src.matchAll(/\b([a-z0-9-]+(?:\.[a-z0-9-]+){2,})\b/gi)) {
+    if (!/^\d/.test(m[1])) found.set(m[1], 'domain');
+  }
+  for (const m of src.matchAll(/\bservice\s+([a-z][a-z0-9_-]{2,})\b/gi)) {
+    found.set(m[1], 'service');
+  }
+  return [...found.entries()].slice(0, 8).map(([name, type]) => ({ name, type }));
+}
+
+// Write-time near-duplicate gate. Returns existing row or null.
+function findNearDuplicate(text, owner, ws) {
+  const rows = db.prepare(
+    "SELECT id, content, importance FROM memories WHERE workspace_id = ? AND state = 'active' AND (owner = ? OR owner IS NULL OR owner = '')"
+  ).all(ws, owner);
+  let best = null, bestSim = 0;
+  for (const r of rows) {
+    const sim = jaccardSimilarity(String(text || ''), String(r.content || ''));
+    if (sim > bestSim) { bestSim = sim; best = r; }
+  }
+  return bestSim >= 0.85 ? best : null;
+}
+
+// Which of the given ids are superseded/contradicted (for score demotion).
+function supersedeMap(ids) {
+  if (!ids || !ids.length) return {};
+  const ph = ids.map(() => '?').join(',');
+  const rows = db.prepare(
+    `SELECT to_memory_id, from_memory_id, relation_type FROM relations
+     WHERE to_memory_id IN (${ph}) AND relation_type IN ('supersede','contradict')`
+  ).all(...ids);
+  const out = {};
+  for (const r of rows) {
+    if (!out[r.to_memory_id]) out[r.to_memory_id] = { by: r.from_memory_id, type: r.relation_type };
+  }
+  return out;
+}
+// === End evolution helpers =============================================
+
+
 // === Rate Limiter ===
 const requestCounts = new Map();
 function checkRateLimit(clientIp) {
@@ -138,10 +207,6 @@ const db = new Database(join(DATA_DIR, 'mnemosyne.db'));
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous = NORMAL');
 
-// v3: add owner + visibility columns (idempotent)
-try { db.exec("ALTER TABLE memories ADD COLUMN owner TEXT DEFAULT ''"); } catch(e) {}
-try { db.exec("ALTER TABLE memories ADD COLUMN visibility TEXT DEFAULT 'private'"); } catch(e) {}
-
 db.exec(`
   CREATE TABLE IF NOT EXISTS workspaces (
     id TEXT PRIMARY KEY,
@@ -202,8 +267,6 @@ db.exec(`
     PRIMARY KEY (memory_id, entity_id)
   );
 
-  CREATE INDEX IF NOT EXISTS idx_memories_owner ON memories(workspace_id, owner, visibility, state);
-  
   CREATE INDEX IF NOT EXISTS idx_memories_timeline ON memories(workspace_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(workspace_id, kind, state);
   CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(workspace_id, state, importance DESC);
@@ -231,6 +294,12 @@ db.exec(`
     redacted INTEGER DEFAULT 0
   );
 `);
+
+// v3: add owner + visibility columns (idempotent) — MUST run after CREATE TABLE
+try { db.exec("ALTER TABLE memories ADD COLUMN owner TEXT DEFAULT ''"); } catch(e) {}
+try { db.exec("ALTER TABLE memories ADD COLUMN visibility TEXT DEFAULT 'private'"); } catch(e) {}
+
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_memories_owner ON memories(workspace_id, owner, visibility, state)'); } catch(e) {}
 
 // Prepared statements
 const stmts = {
@@ -347,69 +416,95 @@ async function route(path, method, query, body, clientIp, userAgent, callerToken
   const workspaceId = query.workspace || body.workspace || 'default';
   let redactedCount = 0;
 
-  // POST /memory/save — Save a memory (with auto-redaction)
+  // POST /memory/save — Save a memory (redaction + dedup gate + extract mode)
   if (path === '/memory/save' && method === 'POST') {
     const id = body.id || `mem_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-    
-    // Auto-create workspace
     stmts.insertWorkspace.run(workspaceId, workspaceId, null);
-    
-    // Redact sensitive data
+
     const originalContent = body.content || '';
     const redactedContent = redactSensitive(originalContent);
     redactedCount = originalContent !== redactedContent ? 1 : 0;
-    
     const redactedSummary = body.summary ? redactSensitive(body.summary) : null;
-    
-    // Auto-generate summary if not provided
     const finalSummary = redactedSummary || autoSummarize(redactedContent, 2);
-    
-    // v3: owner + visibility
+
     const owner = body.owner || workspaceId;
     const visibility = body.visibility || 'private';
-    
-    // Check shared write permission
+
     if ((visibility === 'shared' || visibility === 'public') && !canWriteShared(callerToken, visibility)) {
       stmts.insertAudit.run('save_denied', workspaceId, id, clientIp, userAgent, redactedCount);
       throw { status: 403, message: 'No permission to write ' + visibility + ' memories' };
     }
-    
-    db.prepare(`
+
+    // v3.2 opt-in: extract discrete facts from raw chat text instead of storing the log
+    const facts = body.extract === true ? extractFacts(redactedContent) : [];
+    const payloads = facts.length
+      ? facts.map(t => ({ content: t, summary: null }))
+      : [{ content: redactedContent, summary: finalSummary }];
+
+    const savedIds = [];
+    let deduped = 0;
+    const insertStmt = db.prepare(`
       INSERT INTO memories (id, workspace_id, content, summary, kind, tags, valid_from, valid_until, source_session, source_agent, importance, sensitivity, owner, visibility)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      id, workspaceId, redactedContent, finalSummary,
-      body.kind || 'fact',
-      JSON.stringify(body.tags || []),
-      body.valid_from || Math.floor(Date.now() / 1000),
-      body.valid_until || null,
-      body.source_session || null,
-      body.source_agent || 'unknown',
-      body.importance ?? 0.5,
-      body.sensitivity || 'internal',
-      owner,
-      visibility
-    );
+    `);
 
-    // Link entities if provided
-    if (body.entities && Array.isArray(body.entities)) {
-      for (const ent of body.entities) {
-        const entId = `ent_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    for (const p of payloads) {
+      // v3.2 write-time near-duplicate gate (skip unless caller forces)
+      if (body.force !== true) {
+        const dup = findNearDuplicate(p.content, owner, workspaceId);
+        if (dup) {
+          stmts.bumpAccess.run(dup.id);
+          savedIds.push(dup.id);
+          deduped++;
+          continue;
+        }
+      }
+      const memId = savedIds.length === 0 && !facts.length
+        ? id
+        : `${id}_${savedIds.length}`;
+      insertStmt.run(
+        memId, workspaceId, p.content, p.summary,
+        body.kind || 'fact',
+        JSON.stringify(body.tags || []),
+        body.valid_from || Math.floor(Date.now() / 1000),
+        body.valid_until || null,
+        body.source_session || null,
+        body.source_agent || 'unknown',
+        body.importance ?? 0.5,
+        body.sensitivity || 'internal',
+        owner, visibility
+      );
+      savedIds.push(memId);
+
+      // v3.2 auto entity linking (fills the previously-empty entities table)
+      const ents = (body.entities && Array.isArray(body.entities)) ? body.entities : autoEntities(p.content);
+      for (const ent of ents) {
+        const entId = `ent_${workspaceId}_${String(ent.name).slice(0, 48)}`;
         db.prepare("INSERT OR IGNORE INTO entities (id, workspace_id, name, entity_type, attributes) VALUES (?, ?, ?, ?, ?)")
           .run(entId, workspaceId, ent.name, ent.type || 'concept', JSON.stringify(ent.attributes || {}));
         db.prepare("INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, relevance) VALUES (?, ?, ?)")
-          .run(id, entId, ent.relevance || 1.0);
+          .run(memId, entId, ent.relevance || 1.0);
       }
     }
 
-    stmts.insertAudit.run('save', workspaceId, id, clientIp, userAgent, redactedCount);
-    return { id, status: 'saved', redacted: redactedCount > 0 };
+    stmts.insertAudit.run('save', workspaceId, savedIds[0] || id, clientIp, userAgent, redactedCount);
+    return {
+      id: savedIds[0] || id,
+      ids: savedIds,
+      status: 'saved',
+      extracted: facts.length || 0,
+      deduped,
+      redacted: redactedCount > 0
+    };
   }
+
 
   // GET /memory/get
   if (path === '/memory/get' && method === 'GET') {
     const mem = stmts.getMemory.get(query.id);
     if (!mem) throw { status: 404, message: 'Memory not found' };
+    const sup = supersedeMap([mem.id])[mem.id];
+    if (sup) { mem.superseded_by = sup.by; mem.relation = sup.type; }
     mem.tags = JSON.parse(mem.tags || '[]');
     stmts.bumpAccess.run(query.id);
     stmts.insertAudit.run('read', mem.workspace_id, query.id, clientIp, userAgent, 0);
@@ -450,7 +545,17 @@ async function route(path, method, query, body, clientIp, userAgent, callerToken
       });
     }
     
-    const searchResult = searchMemories(filtered, q, { kind, limit, offset });
+    let searchResult = searchMemories(filtered, q, { kind, limit, offset });
+
+    // v3.2 belief revision: demote memories that a newer one supersedes/contradicts
+    const smap = supersedeMap(searchResult.results.map(m => m.id));
+    if (Object.keys(smap).length) {
+      searchResult.results = searchResult.results.map(m => smap[m.id]
+        ? { ...m, _score: (m._score || 0) * 0.3, superseded_by: smap[m.id].by, relation: smap[m.id].type }
+        : m);
+      searchResult.results.sort((a, b) => (b._score || 0) - (a._score || 0));
+      searchResult.demoted = Object.keys(smap).length;
+    }
     
     // Bump access for returned results
     for (const mem of searchResult.results) {
@@ -633,6 +738,8 @@ async function route(path, method, query, body, clientIp, userAgent, callerToken
     const archiveStmt = db.prepare("UPDATE memories SET state = 'archived', updated_at = unixepoch() WHERE id = ?");
     
     for (const dup of duplicates) {
+      const pair = allMemories.filter(m => m.id === dup.a || m.id === dup.b);
+      if (pair.some(m => m.kind === 'procedure')) continue;  // v3.2
       archiveStmt.run(dup.b);
       const relId = 'rel_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
       stmts.insertRelation.run(relId, dup.a, dup.b, 'supersede', dup.similarity, JSON.stringify({ dream_merged: true }));
@@ -657,7 +764,8 @@ async function route(path, method, query, body, clientIp, userAgent, callerToken
     const staleLow = allMemories.filter(m => 
       m.created_at < staleCutoff && 
       (!m.access_count || m.access_count < 2) && 
-      (m.importance || 0.5) < 0.3
+      (m.importance || 0.5) < 0.3 &&
+      m.kind !== 'procedure'   // v3.2: procedures are versioned assets, never auto-archived
     );
     let archived = 0;
     for (const mem of staleLow) {
@@ -691,6 +799,24 @@ async function route(path, method, query, body, clientIp, userAgent, callerToken
     
     stmts.insertAudit.run('token-create', workspaceId, null, clientIp, userAgent, 0);
     return { token: newToken, owner: ownerName, can_write_shared: canShared, can_write_public: canPublic };
+  }
+
+  // GET /memory/graph — entity timeline (v3.2)
+  if (path === '/memory/graph' && method === 'GET') {
+    const name = query.entity || '';
+    if (!name) return { error: 'entity parameter required' };
+    const ents = db.prepare("SELECT * FROM entities WHERE workspace_id = ? AND name LIKE ?").all(workspaceId, `%${name}%`);
+    const out = [];
+    for (const e of ents) {
+      const mems = db.prepare(`
+        SELECT m.id, m.content, m.summary, m.kind, m.owner, m.visibility, m.created_at, m.importance
+        FROM memories m JOIN memory_entities me ON me.memory_id = m.id
+        WHERE me.entity_id = ? AND m.state = 'active'
+        ORDER BY m.created_at ASC LIMIT 50
+      `).all(e.id);
+      out.push({ entity: e.name, type: e.entity_type, memories: mems });
+    }
+    return { entity: name, count: out.length, results: out };
   }
 
   // POST /memory/migrate-owner — Migrate existing records to owner system

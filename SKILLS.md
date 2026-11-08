@@ -341,3 +341,67 @@ provider 在以下每个早退分支都有 `logger.debug("mnemo: prefetch ...")`
 - 成功返回（带条数和字符数）
 
 `recall_status()` 从 `_last_prefetch` 首行解析真实条数（`N relevant memories`），不再硬编码 1。
+
+---
+
+## v3.2：写入侧与演化侧
+
+### 写入前置去重
+
+相同内容重复写入不再新增记录，返回 `deduped: 1` 并 bump 原记录访问计数：
+
+```json
+POST /memory/save {"content":"...", "owner":"..."}
+→ {"id":"mem_xxx","deduped":0,...}
+（再写一次）
+→ {"id":"mem_xxx","deduped":1,...}   // 未新增
+```
+
+`force: true` 可跳过。
+
+### extract 模式（提炼，不灌日志）
+
+```json
+POST /memory/save
+{"content":"User: 好的，我决定把缓存 TTL 设为 60 秒。Assistant: 明白",
+ "extract": true, "kind":"fact", "owner":"..."}
+→ {"ids":["mem_..._0"], "extracted":1, ...}
+```
+
+纯规则提炼：去掉 `User:/Assistant:` 前缀、切句、过滤"好的/明白/我来"噪声、去重，最多 3 条。
+
+### 信念修订（belief revision）
+
+`supersede` / `contradict` 关系现在真正生效：
+- `/memory/search` 中被取代的旧事实 `_score × 0.3`，排到后面
+- 响应带 `demoted` 计数和 `superseded_by`
+- `/memory/get` 返回 `superseded_by` + `relation`
+
+```
+POST /memory/relate
+{"from_id":"新事实ID","to_id":"旧事实ID","relation_type":"supersede"}
+```
+
+### 实体时间线图谱
+
+save 时自动抽取实体（IP / 域名 / `service X`），写入 `entities` + `memory_entities`。
+
+```
+GET /memory/graph?entity=10.0.0.33
+→ {"entity":"...", "count":1, "results":[{"entity":"10.0.0.33","type":"host","memories":[...按时间排序...]}]}
+```
+
+注意：部分 CDN/WAF 会对含 IP 的 query 参数返回 403，内网直连 `http://127.0.0.1:8790` 可用。
+
+### procedure 免疫
+
+`kind=procedure` 的记录不会被 dream 去重合并或过期归档（过程性记忆是版本化资产）。
+
+### 回归探针
+
+```bash
+./deploy/smoke-test.sh https://mnemosyne.niao.fun YOUR_TOKEN
+```
+
+15 项断言：服务存活、6 条召回探针（top1 命中）、多账户隔离、score、写入去重、extract、4 个端点、健康分。
+内置 0.4s 节流 + 403 重试（ESA CDN 的 CC 防护会对高频请求临时封禁）。
