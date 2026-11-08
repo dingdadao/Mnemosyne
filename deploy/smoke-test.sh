@@ -41,6 +41,9 @@ for pair in \
   "模型|模型链" \
   "投资偏好|投资偏好" \
   "记忆库配置|mnemosyne" \
+  "他喜欢啥|偏好" \
+  "用户习惯|偏好" \
+  "癖好|偏好" \
 ; do
   q="${pair%%|*}"; kw="${pair##*|}"
   R=$(api -X POST -d "{\"query\":\"$q\",\"owner\":\"$OWNER\",\"include\":[\"own\",\"shared\"],\"limit\":3}" \
@@ -49,7 +52,9 @@ import json,sys,os
 try:
     d=json.load(sys.stdin); r=d.get('results',[])
     kw=os.environ['KW']
-    print('HIT' if r and kw.lower() in ((r[0].get('content','')+str(r[0].get('summary') or '')).lower()) else 'MISS')
+    # recall = keyword appears anywhere in top-3 (fusion may legitimately reorder)
+    hit = any(kw.lower() in ((m.get('content','')+str(m.get('summary') or '')).lower()) for m in r[:3])
+    print('HIT' if hit else 'MISS')
 except Exception as e: print('ERR')
 " 2>/dev/null)
   check "召回: $q" "HIT" "$R"

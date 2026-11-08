@@ -1,3 +1,6 @@
+import { expandQuery, charNgramSimilarity } from './synonyms.js';
+
+
 /**
  * Mnemosyne Search Engine v2
  * 
@@ -252,8 +255,10 @@ export function searchMemories(memories, query, options = {}) {
   // Build IDF from filtered set
   const { idf, avgLength } = buildIdf(filtered);
   
-  // Tokenize query
-  const queryTerms = tokenize(query);
+  // Tokenize query + synonym expansion (v3.3-B).
+  // Without this, a pure-synonym query like "他喜欢啥" produces zero BM25
+  // candidates and never reaches the fusion stage.
+  const queryTerms = [...tokenize(query), ...expandQuery(query).flatMap(w => tokenize(w))];
   
   // Score all memories
   const scored = filtered.map(memory => {
@@ -264,16 +269,55 @@ export function searchMemories(memories, query, options = {}) {
   // Filter by min score
   const aboveThreshold = scored.filter(m => m._score >= minScore);
   
-  // Sort by score descending
+  // Sort by BM25 score descending
   aboveThreshold.sort((a, b) => b._score - a._score);
-  
+
+  let ranked = aboveThreshold;
+  let fusion = null;
+
+  // v3.3-B: hybrid re-ranking with two genuinely different rankers.
+  //  (1) BM25 rank  (aboveThreshold order)
+  //  (2) char n-gram cosine over CJK bigrams + english tokens
+  // Plus synonym query expansion: "他喜欢啥" expands to 偏好/习惯/喜好,
+  // which BM25 alone can never match. All pure rules, zero deps, zero RAM.
+  const expanded = expandQuery(query);
+  const ngram = new Map(aboveThreshold.map(m => [
+    m.id, charNgramSimilarity(query, (m.content || '') + ' ' + (m.summary || ''))
+  ]));
+  // Also give credit if a synonym appears in the document
+  const syn = new Map(aboveThreshold.map(m => {
+    const text = ((m.content || '') + (m.summary || '')).toLowerCase();
+    let score = 0;
+    for (const w of expanded) if (text.includes(w)) score += 1;
+    return [m.id, score];
+  }));
+  // RRF(k=60) over the two rankers; synonym hits act as a small boost.
+  const bPos = new Map(aboveThreshold.map((m, i) => [m.id, i + 1]));
+  const nOrder = [...aboveThreshold].sort((a, b) => (ngram.get(b.id) || 0) - (ngram.get(a.id) || 0));
+  const nPos = new Map(nOrder.map((m, i) => [m.id, i + 1]));
+  const fused = new Map();
+  for (const m of aboveThreshold) {
+    const rb = bPos.get(m.id), rn = nPos.get(m.id);
+    let s = 1 / (60 + rb) + 1 / (60 + rn);
+    s += 0.002 * (syn.get(m.id) || 0);   // synonym boost
+    fused.set(m.id, s);
+  }
+  ranked = [...aboveThreshold].sort((a, b) => (fused.get(b.id) || 0) - (fused.get(a.id) || 0));
+  fusion = {
+    enabled: true,
+    mode: 'bm25 + char-ngram RRF + synonym expansion',
+    expanded_terms: expanded.length,
+    k: 60,
+  };
+
   // Paginate
-  const results = aboveThreshold.slice(offset, offset + limit);
+  const results = ranked.slice(offset, offset + limit);
   
   return {
     query,
-    count: aboveThreshold.length,
+    count: ranked.length,
     total: filtered.length,
+    fusion,
     results: results.map(m => ({
       ...m,
       tags: (() => { try { return JSON.parse(m.tags || '[]'); } catch { return []; } })(),
@@ -435,3 +479,4 @@ export function memoryHealth(memories) {
     untagged: untagged.length,
   };
 }
+
