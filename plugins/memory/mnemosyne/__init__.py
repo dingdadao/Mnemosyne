@@ -194,6 +194,17 @@ class MnemosyneProvider(MemoryProvider):
             # that made every Chinese recall block empty.
             kept = [m for m in results if (m.get("importance") or 0.5) >= 0.4]
             _trace("prefetch %d/%d passed importance floor", len(kept), len(results))
+
+            # v3.1: soft relevance re-rank — memories that actually contain
+            # query characters go first; nothing is discarded (server BM25
+            # already ranked). This fixes "长沙天气" returning 投资偏好 first.
+            cjk = "".join(ch for ch in q if "\u4e00" <= ch <= "\u9fff")
+            probes = {cjk[i:i+2] for i in range(len(cjk)-1)} if len(cjk) >= 2 else set()
+            probes |= {w for w in q.lower().split() if len(w) > 1}
+            def _rel(m):
+                text = ((m.get("content") or "") + " " + (m.get("summary") or "")).lower()
+                return sum(1 for p in probes if p in text)
+            kept.sort(key=lambda m: (-_rel(m), -(m.get("importance") or 0.5)))
             kept = kept[:3]
             if not kept:
                 _trace("prefetch empty after floor")
