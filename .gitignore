@@ -1,0 +1,15 @@
+# 依赖与数据
+node_modules/
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# 日志与系统文件
+*.log
+.DS_Store
+
+# 工作区本地产物（备份 / 临时）
+.backups/
+*.bak-*
+tmp/

@@ -17,6 +17,7 @@ import { homedir } from 'os';
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'crypto';
 import Database from 'better-sqlite3';
 import { searchMemories, autoSummarize, findDuplicates, memoryHealth, jaccardSimilarity } from './search.js';
+import { buildBrief } from './brief.js';
 
 // === Config ===
 const args = process.argv.slice(2);
@@ -526,6 +527,54 @@ async function route(path, method, query, body, clientIp, userAgent, callerToken
   }
 
   // POST /memory/search — BM25 + decay + access boost
+  // POST /memory/brief — 首轮开工简报（v4）
+  //
+  // 与 /memory/search 的区别不是"检索"，而是"替 Agent 决定这轮值不值得看、以及看什么"：
+  //   - 检索结果按 goal 做覆盖度过滤，词面不沾边的直接丢掉（见 brief.js 的 coverage）
+  //   - 渲染成陈述式、带日期、逐字保留字面值的块，附带"无关就忽略"的授权
+  //   - 预算内放不下就整条丢，不切断
+  // 返回 "" 是正常结果，表示本轮没有值得注入的东西。
+  if (path === '/memory/brief' && method === 'POST') {
+    const goal = String(body.goal || '').slice(0, 400);
+    const budget = Math.min(Math.max(parseInt(body.budget, 10) || 1200, 300), 4000);
+    const limit = Math.min(Math.max(parseInt(body.limit, 10) || 40, 5), 80);
+
+    // 与 search 一致的可见性过滤（owner + visibility）
+    const owner = body.owner || query.owner || '';
+    const include = body.include || ['own', 'shared'];
+    const allMemories = db.prepare("SELECT * FROM memories WHERE workspace_id = ? AND state = 'active'").all(workspaceId);
+    const visible = !owner ? allMemories : allMemories.filter(m => {
+      const memOwner = m.owner || m.workspace_id;
+      const memVis = m.visibility || 'private';
+      if (include.includes('own') && memOwner === owner) return true;
+      if (include.includes('shared') && memVis === 'shared') return true;
+      if (include.includes('public') && memVis === 'public') return true;
+      if (include.includes('all')) return true;
+      return false;
+    });
+
+    let candidates;
+    if (goal.trim()) {
+      // 多取一些候选，覆盖度过滤后再交给渲染器按预算裁
+      const found = searchMemories(visible, goal, { limit: limit * 2, offset: 0 });
+      candidates = found.results.map(m => ({ ...m, relevance: m._score }));
+    } else {
+      // 没有目标（例如空提示）就退化成"最近进展"，不做覆盖度判断
+      candidates = [...visible]
+        .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
+        .slice(0, limit);
+    }
+
+    const brief = buildBrief({ memories: candidates, budget, goal: goal.trim() });
+
+    stmts.insertAudit.run('brief', workspaceId, null, clientIp, userAgent, 0);
+    return {
+      workspace: workspaceId,
+      text: brief.text,
+      stats: { ...brief.stats, budget, candidates: candidates.length, visible: visible.length },
+    };
+  }
+
   if (path === '/memory/search' && method === 'POST') {
     const q = body.query || '';
     const limit = Math.min(body.limit || 20, 100);

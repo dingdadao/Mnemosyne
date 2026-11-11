@@ -98,7 +98,29 @@ for ep in "/memory/health?workspace=default" "/memory/stats/detailed?workspace=d
   check "端点 $ep" "200" "$C"
 done
 
-# 8. 健康分
+# 8. 首轮简报（v4）
+# 相关 goal 必须命中且块非空；完全无关的 goal 必须不注入（brief 返回空串是正常结果）
+BR=$(api -X POST -d "{\"goal\":\"记忆库配置和限流\",\"owner\":\"$OWNER\",\"include\":[\"own\",\"shared\"],\"budget\":1200}" \
+     "$URL/memory/brief" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin); t=d.get('text') or ''
+    ok = t.startswith('<mnemosyne_memory>') and '\n- ' in t and d.get('stats',{}).get('included',0) >= 1
+    print('OK' if ok else 'EMPTY')
+except Exception: print('ERR')
+" 2>/dev/null)
+check "首轮简报生成" "OK" "$BR"
+
+# 用一个不存在的 owner 造出"空库"场景：brief 必须返回空串而不是硬塞别的仓库的记忆
+BN=$(api -X POST -d '{"goal":"今天中午吃什么比较好","owner":"no-such-owner","include":["own"],"budget":1200}' \
+     "$URL/memory/brief" | python3 -c "
+import json,sys
+try: print('EMPTY' if (json.load(sys.stdin).get('text') or '') == '' else 'LEAK')
+except Exception: print('ERR')
+" 2>/dev/null)
+check "无可见记忆时不注入" "EMPTY" "$BN"
+
+# 9. 健康分
 H=$(api "$URL/memory/health?workspace=default" | python3 -c "import json,sys;print(json.load(sys.stdin).get('score','?'))" 2>/dev/null)
 echo ""
 echo "  Health: $H/100"

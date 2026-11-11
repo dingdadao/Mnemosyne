@@ -249,7 +249,7 @@ MNEMOSYNE_OWNER=dingshuangdao
 
 | 工具 | 接入方式 | 自动召回 | 自动保存 | 多账户 | 说明 |
 |------|---------|---------|---------|--------|------|
-| DSH | 插件 | ✅ 预测式 | ✅ 显式时 | ✅ | 完整支持 |
+| DSH | 插件 | ✅ 首轮简报 + 按需 | ✅ 显式时 | ✅ | 完整支持 |
 | Hermes | MemoryProvider | ✅ prefetch | ✅ sync_turn | ✅ | 完整支持 |
 | Claude Code | MCP | ❌ 手动 | ❌ 手动 | ✅ 参数 | 需手动调工具 |
 | Cursor | MCP | ❌ 手动 | ❌ 手动 | ✅ 参数 | 需手动调工具 |
