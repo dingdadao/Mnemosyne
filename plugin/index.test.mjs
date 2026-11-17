@@ -211,3 +211,13 @@ test('注册了 memory_brief 工具，且工作区参数被带上', async () => 
   assert.equal(res.text, BRIEF);
   assert.equal(calls[0].body.workspace, 'w');
 });
+
+test('声明了 cordis 服务依赖（inject），否则宿主静默不 apply', async () => {
+  const ns = await import('./index.js');
+  // cordis 有服务访问守卫：插件读 ctx.tools / ctx.systemPrompt 前必须声明依赖，
+  // 否则抛 "cannot get property \"tools\" without inject"，fiber 变 FAILED、
+  // apply 一次都不会执行，且宿主日志里看不到任何报错。
+  assert.ok(Array.isArray(ns.inject), 'index.js 必须导出 inject 数组');
+  assert.ok(ns.inject.includes('tools'), "inject 必须包含 'tools'");
+  assert.ok(ns.inject.includes('systemPrompt'), "inject 必须包含 'systemPrompt'");
+});

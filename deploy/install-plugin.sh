@@ -1,7 +1,14 @@
 #!/bin/bash
 # ============================================
 # Mnemosyne DSH Plugin — One-command Install
-# Usage: ./install-plugin.sh [--server http://127.0.0.1:8790] [--token xxx]
+# Usage: ./install-plugin.sh [--server http://127.0.0.1:8790] [--token xxx] [--profile desktop]
+#
+# 两种宿主都支持：
+#   1. 装了 dsh CLI 的机器：额外跑一次 `dsh plugin add`，保证 plugin inventory 一致
+#   2. DSH 桌面版（无 CLI）：直接写 profile —— node_modules + dsh.profile.bundles + 配置覆盖
+#
+# 关键点：光把文件复制进 node_modules 是不够的，必须同时注册到
+# dsh.profile.bundles，否则宿主根本不会加载这个插件（旧版 fallback 就漏了这步）。
 # ============================================
 set -euo pipefail
 
@@ -31,26 +38,32 @@ echo "║           Mnemosyne Plugin — DSH 插件安装                     �
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 
-# Check DSH
-if ! command -v dsh &> /dev/null; then
-  error "dsh CLI not found. Install DeepSeekRuntime first."
+# --- 宿主能力探测（CLI 不是必需的）---
+HAS_CLI=0
+if command -v dsh &> /dev/null; then
+  HAS_CLI=1
+  ok "DSH CLI: $(dsh --version 2>/dev/null || echo 'unknown')"
+else
+  warn "未找到 dsh CLI（DSH 桌面版属正常）——直接写入 profile"
 fi
-ok "DSH $(dsh --version 2>/dev/null || echo 'unknown')"
 
-# Check server connectivity
+# --- 服务连通性 ---
 info "Checking server connectivity..."
 if [ -z "$TOKEN" ]; then
   warn "No token provided. Set MNEMOSYNE_TOKEN or use --token"
 fi
 
-HEALTH=$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$SERVER_URL/health" 2>/dev/null || echo '{}')
-if echo "$HEALTH" | grep -q '"status"'; then
-  ok "Server reachable: $SERVER_URL"
-else
-  warn "Server not reachable at $SERVER_URL (plugin will retry at runtime)"
-fi
+# 用 HTTP 状态码判断，不依赖响应体字段（不同版本的 /health 载荷不一样）
+HEALTH_CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
+  -H "Authorization: Bearer $TOKEN" "$SERVER_URL/health" 2>/dev/null || echo '000')
+case "$HEALTH_CODE" in
+  2*) ok "Server reachable: $SERVER_URL (HTTP $HEALTH_CODE)" ;;
+  401|403) warn "Server 可达但鉴权失败 (HTTP $HEALTH_CODE)：检查 --token" ;;
+  000) warn "Server 不可达：$SERVER_URL（插件运行时会重试）" ;;
+  *) warn "Server 返回 HTTP $HEALTH_CODE：$SERVER_URL（插件运行时会重试）" ;;
+esac
 
-# Find plugin source
+# --- 插件源码 ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(dirname "$SCRIPT_DIR")/plugin"
 
@@ -59,79 +72,47 @@ if [ ! -d "$PLUGIN_DIR" ]; then
 fi
 ok "Plugin source: $PLUGIN_DIR"
 
-# Install plugin
-info "Installing plugin to profile: $PROFILE"
-
-# Create a temporary copy with correct config
-TMP_DIR=$(mktemp -d)
-cp -r "$PLUGIN_DIR/"* "$TMP_DIR/"
-
-# Update cordis.patch.yml with actual server URL and token
-cat > "$TMP_DIR/cordis.patch.yml" << EOF
-- insert:
-    - id: mnemosyne
-      name: 'dsh-mnemosyne'
-      config:
-        mnemosyneUrl: '$SERVER_URL'
-        mnemosyneToken: '$TOKEN'
-        maxHintsPerSession: 3
-        maxAutoRecallsPerSession: 2
-        enableAutoRecall: true
-        enableHints: true
-        hintOrder: 95
-        workspace: 'default'
-        timeoutMs: 5000
-EOF
-
-# Install via dsh plugin add
-info "Running: dsh plugin --profile $PROFILE add $TMP_DIR"
-dsh plugin --profile "$PROFILE" add "$TMP_DIR" 2>&1 || {
-  # Fallback: manual install
-  warn "dsh plugin add failed, trying manual install..."
-  
-  PROFILE_DIR="$HOME/.dsh/profiles/$PROFILE"
-  mkdir -p "$PROFILE_DIR/node_modules/dsh-mnemosyne"
-  cp -r "$TMP_DIR/"* "$PROFILE_DIR/node_modules/dsh-mnemosyne/"
-  
-  # Add to package.json
-  if [ -f "$PROFILE_DIR/package.json" ]; then
-    node -e "
-      const fs = require('fs');
-      const pkg = JSON.parse(fs.readFileSync('$PROFILE_DIR/package.json', 'utf8'));
-      pkg.dependencies = pkg.dependencies || {};
-      pkg.dependencies['dsh-mnemosyne'] = 'file:node_modules/dsh-mnemosyne';
-      fs.writeFileSync('$PROFILE_DIR/package.json', JSON.stringify(pkg, null, 2));
-    "
-  fi
-  
-  ok "Manual install completed"
-}
-
-# Cleanup
-rm -rf "$TMP_DIR"
-
-# Verify
-info "Verifying installation..."
-DUMP=$(dsh --profile "$PROFILE" --dump-config 2>/dev/null | grep -A5 "mnemosyne" || echo "")
-
-if [ -n "$DUMP" ]; then
-  ok "Plugin registered in profile"
-else
-  warn "Could not verify. Check: dsh --profile $PROFILE --dump-config | grep mnemosyne"
+PROFILE_DIR="$HOME/.dsh/profiles/$PROFILE"
+if [ ! -d "$PROFILE_DIR" ]; then
+  error "Profile not found: $PROFILE_DIR (先启动一次 DSH 让它生成 profile)"
 fi
 
-# Summary
+# --- 复制文件 ---
+info "Installing plugin to profile: $PROFILE"
+mkdir -p "$PROFILE_DIR/node_modules/dsh-mnemosyne"
+cp -R "$PLUGIN_DIR/." "$PROFILE_DIR/node_modules/dsh-mnemosyne/"
+ok "Plugin files copied"
+
+# --- 注册 bundle + 写配置覆盖 + 自校验 ---
+info "Registering bundle and writing config override..."
+node "$SCRIPT_DIR/register-profile.js" \
+  --profile-dir "$PROFILE_DIR" \
+  --url "$SERVER_URL" \
+  --token "$TOKEN" || error "注册失败（见上方 ✗ 项）"
+
+# --- CLI 存在时再对齐一次 inventory ---
+if [ "$HAS_CLI" = "1" ]; then
+  info "Running: dsh plugin --profile $PROFILE add $PLUGIN_DIR"
+  if dsh plugin --profile "$PROFILE" add "$PLUGIN_DIR" >/dev/null 2>&1; then
+    ok "dsh plugin add ok"
+  else
+    warn "dsh plugin add skipped (profile already updated manually)"
+  fi
+fi
+
+# --- 汇总 ---
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║                  ✓ Mnemosyne Plugin Installed!                ║"
 echo "╠══════════════════════════════════════════════════════════════╣"
-echo "║  Profile:   $PROFILE                                          "
-echo "║  Server:    $SERVER_URL                                       "
-echo "║                                                               "
-echo "║  Next steps:                                                  "
-echo "║  1. Restart DSH completely                                    "
-echo "║  2. Tools available: memory_save, memory_search,              "
-echo "║     memory_recent, memory_timeline                            "
-echo "║  3. Predictive hints: max 3 per session                       "
-echo "╚══════════════════════════════════════════════════════════════╝"
+printf  "║  Profile:   %-49s║\n" "$PROFILE"
+printf  "║  Server:    %-49s║\n" "$SERVER_URL"
+echo   "║                                                               ║"
+echo   "║  生效方式（二选一）                                           ║"
+echo   "║  1. 重启 DSH                                                  ║"
+echo   "║  2. 改 profile 的 cordis.patch.yml（HMR 自动重载，免重启）     ║"
+echo   "║                                                               ║"
+echo   "║  工具: memory_save / memory_search / memory_recent /          ║"
+echo   "║        memory_timeline / memory_brief                         ║"
+echo   "╚══════════════════════════════════════════════════════════════╝"
 echo ""

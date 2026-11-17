@@ -141,6 +141,10 @@ function sessionIdOf(session) {
   return session.id ?? session.sessionId ?? 'unknown';
 }
 
+// cordis 服务访问守卫：未在 inject 中声明的服务，读取时抛
+// "cannot get property \"tools\" without inject"，插件 fiber 静默 FAILED。
+export const inject = ['tools', 'systemPrompt'];
+
 export function apply(ctx, config) {
   bootMark(`apply start tools=${typeof ctx?.tools?.register} systemPrompt=${typeof ctx?.systemPrompt?.section} logger=${typeof ctx?.logger?.info} url=${config?.mnemosyneUrl || '(none)'} token=${config?.mnemosyneToken ? 'set' : 'EMPTY'}`);
 
