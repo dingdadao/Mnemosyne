@@ -45,6 +45,8 @@
 
 完整的 v4 流程图（5 张：总览 / 首轮简报时序 / `buildBrief` 流水线 / 降级链 / 开发闭环）：[docs/architecture-flow.md](./docs/architecture-flow.md)，渲染好的 SVG 在 [docs/diagrams/](./docs/diagrams/)。
 
+插件加载排障与复盘（fiber 静默 FAILED、cordis inject 守卫、探针排障法）：[docs/plugin-loading-postmortem.md](./docs/plugin-loading-postmortem.md)。
+
 ## 快速开始
 
 ### 1. 部署中心化服务器（一键）

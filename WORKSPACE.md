@@ -39,11 +39,11 @@ Mnemosyne（谟涅摩绪涅）— DSH 的预测式记忆召回插件 + 中心化
 
 ```
 plugin/          DSH 插件（index.js 是主体，cordis.patch.yml 是插入配置模板）
-plugin/index.test.mjs   11 项单测，假 ctx + 替身 fetch，不依赖宿主
+plugin/index.test.mjs   12 项单测，假 ctx + 替身 fetch，不依赖宿主
 server/          中心化服务器（index.js 路由、db.js schema、search.js 检索、brief.js 首轮简报）
 deploy/          install-server / install-plugin / smoke-test / 迁移脚本
 plugins/memory/  Hermes 侧的 Python 插件
-docs/            设计文档（credentials-vault、design-review-hindsight）
+docs/            设计文档（credentials-vault、design-review-hindsight、plugin-loading-postmortem）
 scripts/         工作区脚本（check / dev-sync / register-workspace / lib）
 run.sh           上表的入口
 .backups/        同步前的插件备份（git 忽略）
